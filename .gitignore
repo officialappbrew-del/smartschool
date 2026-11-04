@@ -1,0 +1,16 @@
+# Node.js
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/tsconfig.tsbuildinfo
+
+# Python
+backend/.venv/
+backend/__pycache__/
+backend/**/*.py[cod]
+
+# Local configuration
+.env
+.env.*
+!.env.example
+!backend/.env.example

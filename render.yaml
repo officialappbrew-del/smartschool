@@ -1,0 +1,48 @@
+databases:
+  - name: sms-db
+    databaseName: sms
+    plan: free
+
+services:
+  - type: web
+    name: sms-backend
+    env: python
+    region: oregon
+    plan: free
+    rootDirectory: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: TENANCY_DATABASE_URL
+        fromDatabase:
+          databaseName: sms
+      - key: TENANCY_DOMAIN_SUFFIX
+        value: .yoursms.com
+      - key: TENANCY_RESOLUTION_STRATEGY
+        value: subdomain
+      - key: TENANCY_ISOLATION_STRATEGY
+        value: schema
+      - key: TENANCY_JWT_SECRET
+        value: your-32-char-minimum-secret-here
+      - key: TENANCY_ADMIN_KEY
+        value: your-super-admin-secret
+      - key: FRONTEND_ORIGIN
+        value: https://yoursms.com
+      - key: PUBLIC_APP_BASE_URL
+        value: https://yoursms.com
+      - key: EMAIL_DELIVERY_MODE
+        value: sync
+      - key: EMAIL_HOST
+        value: smtp.gmail.com
+      - key: EMAIL_PORT
+        value: "587"
+      - key: EMAIL_USE_TLS
+        value: "true"
+      - key: EMAIL_HOST_USER
+        value: your-email@gmail.com
+      - key: EMAIL_HOST_PASSWORD
+        value: your-app-password
+      - key: DEFAULT_FROM_EMAIL
+        value: your-email@gmail.com
+      - key: SERVER_EMAIL
+        value: your-email@gmail.com
