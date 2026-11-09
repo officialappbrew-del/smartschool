@@ -26,14 +26,21 @@ type Account = {
   role: string;
 };
 
+type ClassSection = {
+  id: string;
+  name: string;
+  academic_year: string;
+  is_active: boolean;
+};
+
 const emptyStudent: StudentInput = {
   admission_number: "",
   first_name: "",
   last_name: "",
   date_of_birth: "",
   gender: "prefer_not_to_say",
-  class_name: "",
-  academic_year: "",
+  class_section_id: "",
+  admission_status: "new",
   guardian_name: "",
   guardian_email: null,
   guardian_phone: "",
@@ -41,8 +48,8 @@ const emptyStudent: StudentInput = {
 };
 
 const csvTemplate =
-  "admission_number,first_name,last_name,date_of_birth,gender,class_name,academic_year,guardian_name,guardian_email,guardian_phone,medical_notes\r\n" +
-  "GR-001,Amina,Okafor,2015-05-04,female,Grade 5A,2026-2027,Ada Okafor,ada@example.com,+2348000000000,\r\n";
+  "admission_number,first_name,last_name,date_of_birth,gender,class_name,academic_year,admission_status,guardian_name,guardian_email,guardian_phone,medical_notes\r\n" +
+  "GR-001,Amina,Okafor,2015-05-04,female,Grade 5A,2026-2027,new,Ada Okafor,ada@example.com,+2348000000000,\r\n";
 
 async function fetchStudentPage(
   includeInactive: boolean,
@@ -64,6 +71,7 @@ function initials(student: Student): string {
 
 export default function StudentWorkspace() {
   const [students, setStudents] = useState<Student[]>([]);
+  const [classes, setClasses] = useState<ClassSection[]>([]);
   const [account, setAccount] = useState<Account | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
@@ -89,9 +97,13 @@ export default function StudentWorkspace() {
         return;
       }
       try {
-        const currentAccount = await schoolApi<Account>("/api/v1/auth/me");
+        const [currentAccount, classSections] = await Promise.all([
+          schoolApi<Account>("/api/v1/auth/me"),
+          schoolApi<ClassSection[]>("/api/v1/classes"),
+        ]);
         if (active) {
           setAccount(currentAccount);
+          setClasses(classSections.filter((item) => item.is_active));
         }
       } catch (error: unknown) {
         if (!active) return;
@@ -160,8 +172,10 @@ export default function StudentWorkspace() {
       last_name: student.last_name,
       date_of_birth: student.date_of_birth,
       gender: student.gender,
-      class_name: student.class_name,
-      academic_year: student.academic_year,
+      class_section_id: classes.find(
+        (item) => item.name === student.class_name && item.academic_year === student.academic_year,
+      )?.id ?? "",
+      admission_status: student.admission_status,
       guardian_name: student.guardian_name,
       guardian_email: student.guardian_email,
       guardian_phone: student.guardian_phone,
@@ -385,7 +399,10 @@ export default function StudentWorkspace() {
                       <td><span className="class-name">{student.admission_number}</span></td>
                       <td><span className="class-name">{student.class_name}</span><small className="record-subtext">{student.academic_year}</small></td>
                       <td><span className="guardian-cell"><strong>{student.guardian_name}</strong><small>{student.guardian_email || student.guardian_phone}</small></span></td>
-                      <td><span className={`record-status${student.is_active ? " is-active" : ""}`}>{student.is_active ? "Active" : "Archived"}</span></td>
+                      <td>
+                        <span className={`record-status${student.is_active ? " is-active" : ""}`}>{student.is_active ? "Active" : "Archived"}</span>
+                        <small className="record-subtext">{student.admission_status.replace(/_/g, " ")}</small>
+                      </td>
                       <td className="student-row-actions">
                         <button
                           className="archive-student"
@@ -432,14 +449,30 @@ export default function StudentWorkspace() {
                 <label>First name<input required maxLength={80} value={form.first_name} onChange={(event) => updateForm("first_name", event.target.value)} /></label>
                 <label>Last name<input required maxLength={80} value={form.last_name} onChange={(event) => updateForm("last_name", event.target.value)} /></label>
                 <label>Gender<select value={form.gender} onChange={(event) => updateForm("gender", event.target.value)}><option value="prefer_not_to_say">Prefer not to say</option><option value="female">Female</option><option value="male">Male</option><option value="other">Other</option></select></label>
-                <label>Class / section<input required maxLength={80} value={form.class_name} onChange={(event) => updateForm("class_name", event.target.value)} /></label>
-                <label>Academic year<input required maxLength={32} placeholder="2026-2027" value={form.academic_year} onChange={(event) => updateForm("academic_year", event.target.value)} /></label>
+                <label className="student-form-wide">Class / section · Academic year
+                  <select required value={form.class_section_id} onChange={(event) => updateForm("class_section_id", event.target.value)} disabled={classes.length === 0}>
+                    <option value="">{classes.length ? "Select an existing class section" : "Create a class section first"}</option>
+                    {classes.map((classSection) => (
+                      <option key={classSection.id} value={classSection.id}>
+                        {classSection.name} · {classSection.academic_year}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>Admission status<select value={form.admission_status} onChange={(event) => updateForm("admission_status", event.target.value as StudentInput["admission_status"])}>
+                  <option value="new">New</option>
+                  <option value="in_review">In review</option>
+                  <option value="accepted">Accepted</option>
+                  <option value="enrolled">Enrolled</option>
+                  <option value="waitlist">Waitlist</option>
+                  <option value="withdrawn">Withdrawn</option>
+                </select></label>
                 <label>Guardian name<input required maxLength={160} value={form.guardian_name} onChange={(event) => updateForm("guardian_name", event.target.value)} /></label>
                 <label>Guardian email<input type="email" maxLength={254} value={form.guardian_email ?? ""} onChange={(event) => updateForm("guardian_email", event.target.value)} /></label>
                 <label>Guardian phone<input required maxLength={32} value={form.guardian_phone} onChange={(event) => updateForm("guardian_phone", event.target.value)} /></label>
                 <label className="student-form-wide">Medical notes<textarea maxLength={2000} rows={3} value={form.medical_notes ?? ""} onChange={(event) => updateForm("medical_notes", event.target.value)} /></label>
               </div>
-              <footer><button className="button button-secondary" type="button" onClick={() => setShowAdmissionForm(false)}>Cancel</button><button className="button button-primary" type="submit" disabled={saving}>{saving ? "Saving…" : editingStudentId ? "Save changes" : "Save student"}</button></footer>
+              <footer><button className="button button-secondary" type="button" onClick={() => setShowAdmissionForm(false)}>Cancel</button><button className="button button-primary" type="submit" disabled={saving || classes.length === 0 || !form.class_section_id}>{saving ? "Saving…" : editingStudentId ? "Save changes" : "Save student"}</button></footer>
             </form>
           </section>
         </div>

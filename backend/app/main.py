@@ -1,4 +1,5 @@
 import csv
+import html
 import hashlib
 import hmac
 import io
@@ -11,6 +12,7 @@ import smtplib
 import threading
 import time
 import uuid
+from collections import defaultdict
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime, timedelta
@@ -35,7 +37,7 @@ from fastapi_tenancy.core.types import Tenant, TenantStatus
 from fastapi_tenancy.migrations.manager import TenantMigrationManager
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from pwdlib import PasswordHash
-from sqlalchemy import Boolean, CheckConstraint, Date, DateTime, ForeignKey, MetaData, Numeric, String, Table, Text, UniqueConstraint, and_, case, func, insert, or_, select, update
+from sqlalchemy import Boolean, CheckConstraint, Date, DateTime, ForeignKey, Index, MetaData, Numeric, String, Table, Text, UniqueConstraint, and_, case, func, insert, inspect as sqlalchemy_inspect, or_, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -104,6 +106,25 @@ class SchoolProfile(TenantBase):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class SchoolCampus(TenantBase):
+    __tablename__ = "school_campuses"
+    __table_args__ = (
+        UniqueConstraint("code", name="uq_school_campuses_code"),
+        CheckConstraint("status IN ('active', 'inactive')", name="ck_school_campuses_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: uuid.uuid4().hex)
+    name: Mapped[str] = mapped_column(String(160), nullable=False)
+    code: Mapped[str] = mapped_column(String(32), nullable=False)
+    address: Mapped[str | None] = mapped_column(String(255))
+    phone: Mapped[str | None] = mapped_column(String(32))
+    email: Mapped[str | None] = mapped_column(String(254))
+    is_primary: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class TenantUser(TenantBase):
     __tablename__ = "users"
     __table_args__ = (UniqueConstraint("email", name="uq_users_email"),)
@@ -144,6 +165,7 @@ class Student(TenantBase):
     guardian_phone: Mapped[str] = mapped_column(String(32), nullable=False)
     medical_notes: Mapped[str | None] = mapped_column(Text)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    admission_status: Mapped[str] = mapped_column(String(24), nullable=False, default="new")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -179,6 +201,68 @@ class AcademicTerm(TenantBase):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class ReportCardPublication(TenantBase):
+    __tablename__ = "report_card_publications"
+    __table_args__ = (
+        UniqueConstraint(
+            "class_section_id",
+            "term_id",
+            name="uq_report_card_publications_class_term",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    class_section_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    term_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    published_by_user_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    published_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+
+class ReportCardNotification(TenantBase):
+    __tablename__ = "report_card_notifications"
+    __table_args__ = (
+        UniqueConstraint(
+            "publication_id",
+            "student_id",
+            name="uq_report_card_notifications_publication_student",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'sent', 'failed')",
+            name="ck_report_card_notifications_status",
+        ),
+        Index(
+            "ix_report_card_notifications_publication_status",
+            "publication_id",
+            "status",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    publication_id: Mapped[str] = mapped_column(
+        ForeignKey("report_card_publications.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    student_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    recipient_email: Mapped[str] = mapped_column(String(254), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="pending",
+        server_default="pending",
+    )
+    last_error: Mapped[str | None] = mapped_column(String(500))
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+
 class ClassSection(TenantBase):
     __tablename__ = "class_sections"
     __table_args__ = (
@@ -191,6 +275,7 @@ class ClassSection(TenantBase):
         ForeignKey("academic_years.id"),
         nullable=False,
     )
+    campus_id: Mapped[str | None] = mapped_column(ForeignKey("school_campuses.id"))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -369,6 +454,160 @@ class Payment(TenantBase):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class LibrarySettings(TenantBase):
+    __tablename__ = "library_settings"
+    __table_args__ = (
+        CheckConstraint("daily_fine_rate >= 0", name="ck_library_settings_fine_rate_nonnegative"),
+        CheckConstraint("currency = upper(currency)", name="ck_library_settings_currency_upper"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    daily_fine_rate: Mapped[Decimal] = mapped_column(Numeric(8, 2), nullable=False, default=Decimal("0"))
+    currency: Mapped[str] = mapped_column(String(3), nullable=False, default="NGN")
+    updated_by_user_id: Mapped[str | None] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class LibraryBook(TenantBase):
+    __tablename__ = "library_books"
+    __table_args__ = (
+        CheckConstraint("total_copies > 0", name="ck_library_books_total_copies_positive"),
+        CheckConstraint("available_copies >= 0", name="ck_library_books_available_copies_nonnegative"),
+        CheckConstraint("status IN ('available', 'archived')", name="ck_library_books_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    title: Mapped[str] = mapped_column(String(180), nullable=False)
+    author: Mapped[str] = mapped_column(String(160), nullable=False)
+    isbn: Mapped[str | None] = mapped_column(String(32))
+    category: Mapped[str | None] = mapped_column(String(80))
+    shelf_location: Mapped[str | None] = mapped_column(String(120))
+    total_copies: Mapped[int] = mapped_column(nullable=False, default=1)
+    available_copies: Mapped[int] = mapped_column(nullable=False, default=1)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="available")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class LibraryLoan(TenantBase):
+    __tablename__ = "library_loans"
+    __table_args__ = (
+        CheckConstraint("status IN ('active', 'returned')", name="ck_library_loans_status"),
+        CheckConstraint("fine_amount >= 0", name="ck_library_loans_fine_amount_nonnegative"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    book_id: Mapped[str] = mapped_column(ForeignKey("library_books.id"), nullable=False)
+    student_id: Mapped[str] = mapped_column(ForeignKey("students.id"), nullable=False)
+    borrower_name: Mapped[str] = mapped_column(String(180), nullable=False)
+    issued_by_user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
+    checked_out_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    due_date: Mapped[date] = mapped_column(Date, nullable=False)
+    returned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    fine_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False, default=Decimal("0"))
+    fine_currency: Mapped[str] = mapped_column(String(3), nullable=False, default="NGN")
+    notes: Mapped[str | None] = mapped_column(String(500))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TransportRoute(TenantBase):
+    __tablename__ = "transport_routes"
+    __table_args__ = (
+        CheckConstraint("capacity > 0", name="ck_transport_routes_capacity_positive"),
+        CheckConstraint("status IN ('active', 'inactive')", name="ck_transport_routes_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    vehicle_number: Mapped[str] = mapped_column(String(48), nullable=False)
+    driver_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    pickup_point: Mapped[str] = mapped_column(String(160), nullable=False)
+    dropoff_point: Mapped[str] = mapped_column(String(160), nullable=False)
+    capacity: Mapped[int] = mapped_column(nullable=False, default=1)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TransportAssignment(TenantBase):
+    __tablename__ = "transport_assignments"
+    __table_args__ = (
+        CheckConstraint("status IN ('assigned', 'active', 'inactive')", name="ck_transport_assignments_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    route_id: Mapped[str] = mapped_column(ForeignKey("transport_routes.id"), nullable=False)
+    student_id: Mapped[str] = mapped_column(ForeignKey("students.id"), nullable=False)
+    pickup_point: Mapped[str] = mapped_column(String(160), nullable=False)
+    dropoff_point: Mapped[str] = mapped_column(String(160), nullable=False)
+    pickup_time: Mapped[str | None] = mapped_column(String(32))
+    dropoff_time: Mapped[str | None] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="assigned")
+    notes: Mapped[str | None] = mapped_column(String(300))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TransportLog(TenantBase):
+    __tablename__ = "transport_logs"
+    __table_args__ = (
+        CheckConstraint("event_type IN ('pickup', 'dropoff', 'delay', 'note')", name="ck_transport_logs_event_type"),
+        CheckConstraint("status IN ('on_time', 'late', 'missed')", name="ck_transport_logs_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    route_id: Mapped[str] = mapped_column(ForeignKey("transport_routes.id"), nullable=False)
+    student_id: Mapped[str] = mapped_column(ForeignKey("students.id"), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    event_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="on_time")
+    note: Mapped[str | None] = mapped_column(Text)
+    created_by_user_id: Mapped[str | None] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class BoardingRoom(TenantBase):
+    __tablename__ = "boarding_rooms"
+    __table_args__ = (
+        CheckConstraint("room_type IN ('single', 'double', 'dormitory')", name="ck_boarding_rooms_room_type"),
+        CheckConstraint("capacity > 0", name="ck_boarding_rooms_capacity_positive"),
+        CheckConstraint("monthly_fee > 0", name="ck_boarding_rooms_monthly_fee_positive"),
+        CheckConstraint("status IN ('available', 'full', 'maintenance')", name="ck_boarding_rooms_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    room_type: Mapped[str] = mapped_column(String(16), nullable=False, default="single")
+    capacity: Mapped[int] = mapped_column(nullable=False, default=1)
+    monthly_fee: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="available")
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class BoardingAssignment(TenantBase):
+    __tablename__ = "boarding_assignments"
+    __table_args__ = (
+        CheckConstraint("status IN ('active', 'pending', 'left')", name="ck_boarding_assignments_status"),
+        CheckConstraint("room_fee > 0", name="ck_boarding_assignments_room_fee_positive"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    room_id: Mapped[str] = mapped_column(ForeignKey("boarding_rooms.id"), nullable=False)
+    student_id: Mapped[str] = mapped_column(ForeignKey("students.id"), nullable=False)
+    bed_number: Mapped[str | None] = mapped_column(String(24))
+    check_in_date: Mapped[date] = mapped_column(Date, nullable=False)
+    room_fee: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class Announcement(TenantBase):
     __tablename__ = "announcements"
     __table_args__ = (
@@ -528,6 +767,98 @@ class StaffContract(TenantBase):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class PayrollRun(TenantBase):
+    __tablename__ = "payroll_runs"
+    __table_args__ = (
+        CheckConstraint("status IN ('draft', 'approved', 'paid')", name="ck_payroll_runs_status"),
+        CheckConstraint("pay_period_end >= pay_period_start", name="ck_payroll_runs_period_range"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    label: Mapped[str] = mapped_column(String(120), nullable=False)
+    pay_period_start: Mapped[date] = mapped_column(Date, nullable=False)
+    pay_period_end: Mapped[date] = mapped_column(Date, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="draft")
+    total_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False, default=Decimal("0"))
+    created_by_user_id: Mapped[str | None] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class PayrollEntry(TenantBase):
+    __tablename__ = "payroll_entries"
+    __table_args__ = (
+        UniqueConstraint("run_id", "staff_profile_id", name="uq_payroll_entries_run_staff"),
+        CheckConstraint("base_salary >= 0", name="ck_payroll_entries_base_salary_nonnegative"),
+        CheckConstraint("allowances >= 0", name="ck_payroll_entries_allowances_nonnegative"),
+        CheckConstraint("deductions >= 0", name="ck_payroll_entries_deductions_nonnegative"),
+        CheckConstraint("net_pay >= 0", name="ck_payroll_entries_net_pay_nonnegative"),
+        CheckConstraint("status IN ('draft', 'approved', 'paid')", name="ck_payroll_entries_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("payroll_runs.id"), nullable=False)
+    staff_profile_id: Mapped[str] = mapped_column(ForeignKey("staff_profiles.id"), nullable=False)
+    base_salary: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=Decimal("0"))
+    allowances: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=Decimal("0"))
+    deductions: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=Decimal("0"))
+    net_pay: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=Decimal("0"))
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="draft")
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class LearningCourse(TenantBase):
+    __tablename__ = "learning_courses"
+    __table_args__ = (
+        CheckConstraint("status IN ('draft', 'published')", name="ck_learning_courses_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    title: Mapped[str] = mapped_column(String(180), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    class_section_id: Mapped[str | None] = mapped_column(ForeignKey("class_sections.id"))
+    teacher_user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="draft")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class LearningAssignment(TenantBase):
+    __tablename__ = "learning_assignments"
+    __table_args__ = (
+        CheckConstraint("status IN ('draft', 'published', 'closed')", name="ck_learning_assignments_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    course_id: Mapped[str] = mapped_column(ForeignKey("learning_courses.id"), nullable=False)
+    title: Mapped[str] = mapped_column(String(180), nullable=False)
+    instructions: Mapped[str | None] = mapped_column(Text)
+    due_date: Mapped[date | None] = mapped_column(Date)
+    max_score: Mapped[Decimal | None] = mapped_column(Numeric(8, 2))
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="draft")
+    created_by_user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class LearningSubmission(TenantBase):
+    __tablename__ = "learning_submissions"
+    __table_args__ = (
+        UniqueConstraint("assignment_id", "student_id", name="uq_learning_submissions_assignment_student"),
+        CheckConstraint("status IN ('pending', 'submitted', 'graded')", name="ck_learning_submissions_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    assignment_id: Mapped[str] = mapped_column(ForeignKey("learning_assignments.id"), nullable=False)
+    student_id: Mapped[str] = mapped_column(ForeignKey("students.id"), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    score: Mapped[Decimal | None] = mapped_column(Numeric(8, 2))
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 def tenant_tables(session: AsyncSession) -> tuple[Table, Table]:
     prefix = session.info.get("table_prefix")
     if prefix is None:
@@ -644,6 +975,23 @@ def tenant_academic_term_table(session: AsyncSession) -> Table:
     )
 
 
+def tenant_report_card_tables(session: AsyncSession) -> tuple[Table, Table]:
+    prefix = session.info.get("table_prefix")
+    if prefix is None:
+        return ReportCardPublication.__table__, ReportCardNotification.__table__
+
+    metadata = MetaData()
+    publication_table = ReportCardPublication.__table__.to_metadata(
+        metadata,
+        name=f"{prefix}{ReportCardPublication.__tablename__}",
+    )
+    notification_table = ReportCardNotification.__table__.to_metadata(
+        metadata,
+        name=f"{prefix}{ReportCardNotification.__tablename__}",
+    )
+    return publication_table, notification_table
+
+
 def tenant_billing_tables(session: AsyncSession) -> tuple[Table, Table, Table, Table]:
     prefix = session.info.get("table_prefix")
     if prefix is None:
@@ -672,6 +1020,65 @@ def tenant_billing_tables(session: AsyncSession) -> tuple[Table, Table, Table, T
         name=f"{prefix}{Payment.__tablename__}",
     )
     return settings_table, fee_table, invoice_table, payment_table
+
+
+def tenant_library_tables(session: AsyncSession) -> tuple[Table, Table, Table]:
+    prefix = session.info.get("table_prefix")
+    if prefix is None:
+        return LibrarySettings.__table__, LibraryBook.__table__, LibraryLoan.__table__
+
+    metadata = MetaData()
+    settings_table = LibrarySettings.__table__.to_metadata(
+        metadata,
+        name=f"{prefix}{LibrarySettings.__tablename__}",
+    )
+    book_table = LibraryBook.__table__.to_metadata(
+        metadata,
+        name=f"{prefix}{LibraryBook.__tablename__}",
+    )
+    loan_table = LibraryLoan.__table__.to_metadata(
+        metadata,
+        name=f"{prefix}{LibraryLoan.__tablename__}",
+    )
+    return settings_table, book_table, loan_table
+
+
+def tenant_transport_tables(session: AsyncSession) -> tuple[Table, Table, Table]:
+    prefix = session.info.get("table_prefix")
+    if prefix is None:
+        return TransportRoute.__table__, TransportAssignment.__table__, TransportLog.__table__
+
+    metadata = MetaData()
+    route_table = TransportRoute.__table__.to_metadata(
+        metadata,
+        name=f"{prefix}{TransportRoute.__tablename__}",
+    )
+    assignment_table = TransportAssignment.__table__.to_metadata(
+        metadata,
+        name=f"{prefix}{TransportAssignment.__tablename__}",
+    )
+    log_table = TransportLog.__table__.to_metadata(
+        metadata,
+        name=f"{prefix}{TransportLog.__tablename__}",
+    )
+    return route_table, assignment_table, log_table
+
+
+def tenant_boarding_tables(session: AsyncSession) -> tuple[Table, Table]:
+    prefix = session.info.get("table_prefix")
+    if prefix is None:
+        return BoardingRoom.__table__, BoardingAssignment.__table__
+
+    metadata = MetaData()
+    room_table = BoardingRoom.__table__.to_metadata(
+        metadata,
+        name=f"{prefix}{BoardingRoom.__tablename__}",
+    )
+    assignment_table = BoardingAssignment.__table__.to_metadata(
+        metadata,
+        name=f"{prefix}{BoardingAssignment.__tablename__}",
+    )
+    return room_table, assignment_table
 
 
 def tenant_announcement_tables(session: AsyncSession) -> tuple[Table, Table]:
@@ -742,6 +1149,56 @@ def tenant_staff_tables(session: AsyncSession) -> tuple[Table, Table, Table]:
         name=f"{prefix}{StaffContract.__tablename__}",
     )
     return profile_table, qualification_table, contract_table
+
+
+def tenant_payroll_tables(session: AsyncSession) -> tuple[Table, Table]:
+    prefix = session.info.get("table_prefix")
+    if prefix is None:
+        return PayrollRun.__table__, PayrollEntry.__table__
+
+    metadata = MetaData()
+    run_table = PayrollRun.__table__.to_metadata(
+        metadata,
+        name=f"{prefix}{PayrollRun.__tablename__}",
+    )
+    entry_table = PayrollEntry.__table__.to_metadata(
+        metadata,
+        name=f"{prefix}{PayrollEntry.__tablename__}",
+    )
+    return run_table, entry_table
+
+
+def tenant_lms_tables(session: AsyncSession) -> tuple[Table, Table, Table]:
+    prefix = session.info.get("table_prefix")
+    if prefix is None:
+        return LearningCourse.__table__, LearningAssignment.__table__, LearningSubmission.__table__
+
+    metadata = MetaData()
+    course_table = LearningCourse.__table__.to_metadata(
+        metadata,
+        name=f"{prefix}{LearningCourse.__tablename__}",
+    )
+    assignment_table = LearningAssignment.__table__.to_metadata(
+        metadata,
+        name=f"{prefix}{LearningAssignment.__tablename__}",
+    )
+    submission_table = LearningSubmission.__table__.to_metadata(
+        metadata,
+        name=f"{prefix}{LearningSubmission.__tablename__}",
+    )
+    return course_table, assignment_table, submission_table
+
+
+def tenant_campus_table(session: AsyncSession) -> Table:
+    prefix = session.info.get("table_prefix")
+    if prefix is None:
+        return SchoolCampus.__table__
+
+    metadata = MetaData()
+    return SchoolCampus.__table__.to_metadata(
+        metadata,
+        name=f"{prefix}{SchoolCampus.__tablename__}",
+    )
 
 
 def billing_fernet() -> Fernet:
@@ -1192,6 +1649,7 @@ def send_email(recipient: str, subject: str, body: str) -> None:
     message["To"] = recipient
     message["Subject"] = subject
     message.set_content(body)
+    message.add_alternative(render_email_html(subject, body), subtype="html")
 
     smtp_class = smtplib.SMTP_SSL if use_ssl else smtplib.SMTP
     with smtp_class(host, port, timeout=15) as smtp:
@@ -1202,7 +1660,117 @@ def send_email(recipient: str, subject: str, body: str) -> None:
         smtp.send_message(message)
 
 
-def action_url(tenant_identifier: str, path: str, token: str) -> str:
+def render_email_html(subject: str, body: str) -> str:
+    escaped_subject = html.escape(subject)
+    paragraphs: list[str] = []
+    current_lines: list[str] = []
+    action_button = ""
+
+    def safe_link(url: str, label: str) -> str:
+        parsed = urlsplit(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return html.escape(url)
+        return (
+            f'<a href="{html.escape(url, quote=True)}" '
+            f'style="color:#176b57;text-decoration:underline;">'
+            f"{html.escape(label)}</a>"
+        )
+
+    def format_line(line: str) -> str:
+        pieces: list[str] = []
+        cursor = 0
+        for match in re.finditer(r"https?://[^\s<>]+", line):
+            url = match.group(0)
+            suffix = ""
+            while url and url[-1] in ".,;:!?":
+                suffix = url[-1] + suffix
+                url = url[:-1]
+            pieces.append(html.escape(line[cursor:match.start()]))
+            pieces.append(safe_link(url, url))
+            pieces.append(html.escape(suffix))
+            cursor = match.end()
+        pieces.append(html.escape(line[cursor:]))
+        return "".join(pieces)
+
+    def flush_paragraph() -> None:
+        if current_lines:
+            paragraphs.append(
+                '<p style="margin:0 0 16px;color:#344054;font-size:15px;'
+                'line-height:1.65;">'
+                + "<br>".join(format_line(line) for line in current_lines)
+                + "</p>"
+            )
+            current_lines.clear()
+
+    for line in body.splitlines():
+        trimmed = line.strip()
+        parsed = urlsplit(trimmed) if trimmed.startswith(("https://", "http://")) else None
+        if parsed is not None and parsed.scheme in {"https", "http"} and parsed.hostname:
+            flush_paragraph()
+            label = (
+                "Reset password"
+                if parsed.path.rstrip("/").endswith("/password/reset")
+                else "Accept invitation"
+                if parsed.path.rstrip("/").endswith("/invitation/accept")
+                else "Open Northstar"
+            )
+            action_button = (
+                '<p style="margin:24px 0 28px;">'
+                f'<a href="{html.escape(trimmed, quote=True)}" '
+                'style="display:inline-block;background:#176b57;color:#ffffff;'
+                'font-size:15px;font-weight:600;line-height:1.2;text-decoration:none;'
+                'padding:14px 22px;border-radius:6px;">'
+                f"{label}</a></p>"
+            )
+            continue
+        if not trimmed:
+            flush_paragraph()
+            continue
+        current_lines.append(line)
+    flush_paragraph()
+
+    content = "".join(paragraphs)
+    if action_button:
+        last_paragraph = content.rfind("</p>")
+        if last_paragraph >= 0:
+            content = (
+                content[: last_paragraph + 4]
+                + action_button
+                + content[last_paragraph + 4 :]
+            )
+        else:
+            content += action_button
+
+    return (
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        f"<title>{escaped_subject}</title></head>"
+        '<body style="margin:0;background:#f2f5f4;font-family:Arial,Helvetica,sans-serif;">'
+        '<div style="display:none;max-height:0;overflow:hidden;opacity:0;">'
+        f"{escaped_subject}</div>"
+        '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" '
+        'style="background:#f2f5f4;padding:32px 12px;"><tr><td align="center">'
+        '<table role="presentation" width="600" cellspacing="0" cellpadding="0" '
+        'style="width:100%;max-width:600px;background:#ffffff;border:1px solid #e4e9e7;'
+        'border-radius:10px;overflow:hidden;"><tr><td '
+        'style="padding:25px 32px;background:#123d36;color:#ffffff;">'
+        '<div style="font-size:21px;font-weight:700;letter-spacing:.2px;">Northstar</div>'
+        '<div style="margin-top:5px;color:#c5ded7;font-size:11px;letter-spacing:1.4px;'
+        'text-transform:uppercase;">School management platform</div>'
+        '</td></tr><tr><td style="padding:32px;">'
+        f'<h1 style="margin:0 0 22px;color:#172b27;font-size:22px;line-height:1.35;">'
+        f"{escaped_subject}</h1>{content}"
+        '<div style="border-top:1px solid #e8edeb;margin-top:28px;padding-top:18px;'
+        'color:#66736f;font-size:12px;line-height:1.6;">'
+        "This is an automated message from Northstar. If you were not expecting it, "
+        "you can safely ignore it or contact your school administrator."
+        '</div></td></tr></table><div style="padding:18px 8px;color:#89938f;'
+        'font-size:11px;">Northstar · School administration</div>'
+        '</td></tr></table></body></html>'
+    )
+
+
+def tenant_app_url(tenant_identifier: str, path: str) -> str:
     base_url = os.getenv("PUBLIC_APP_BASE_URL", "http://localhost:3000")
     try:
         parsed = urlsplit(base_url)
@@ -1223,12 +1791,76 @@ def action_url(tenant_identifier: str, path: str, token: str) -> str:
     netloc = school_hostname
     if port is not None:
         netloc = f"{netloc}:{port}"
+    return urlunsplit((parsed.scheme, netloc, path, "", ""))
+
+
+def action_url(tenant_identifier: str, path: str, token: str) -> str:
+    parsed = urlsplit(tenant_app_url(tenant_identifier, path))
     query = f"token={quote(token, safe='')}"
-    return urlunsplit((parsed.scheme, netloc, path, query, ""))
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, ""))
 
 
 async def deliver_action_email(recipient: str, subject: str, body: str) -> None:
     await asyncio.to_thread(send_email, recipient, subject, body)
+
+
+ATTENDANCE_ALERT_THRESHOLD = Decimal("80")
+ATTENDANCE_ALERT_MINIMUM_DAYS = 5
+
+
+def should_send_attendance_threshold_alert(
+    previous_summary: tuple[int, int],
+    current_summary: tuple[int, int],
+) -> bool:
+    previous_attended, previous_days = previous_summary
+    current_attended, current_days = current_summary
+    if current_days < ATTENDANCE_ALERT_MINIMUM_DAYS:
+        return False
+
+    current_rate = Decimal(current_attended) / Decimal(current_days) * Decimal(100)
+    if current_rate >= ATTENDANCE_ALERT_THRESHOLD:
+        return False
+
+    if previous_days < ATTENDANCE_ALERT_MINIMUM_DAYS:
+        return True
+    previous_rate = Decimal(previous_attended) / Decimal(previous_days) * Decimal(100)
+    return previous_rate >= ATTENDANCE_ALERT_THRESHOLD
+
+
+async def get_attendance_summary(
+    session: AsyncSession,
+    attendance_table: Table,
+    student_id: str,
+) -> tuple[int, int]:
+    result = await session.execute(
+        select(
+            func.coalesce(
+                func.sum(
+                    case(
+                        (attendance_table.c.status.in_(("present", "late")), 1),
+                        else_=0,
+                    )
+                ),
+                0,
+            ),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            attendance_table.c.status.in_(
+                                ("present", "late", "absent")
+                            ),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            ),
+        ).where(attendance_table.c.student_id == student_id)
+    )
+    attended_days, marked_days = result.one()
+    return int(attended_days), int(marked_days)
 
 
 class TenantRegistration(BaseModel):
@@ -1388,8 +2020,10 @@ class StudentAdmission(BaseModel):
     last_name: str = Field(min_length=1, max_length=80)
     date_of_birth: date
     gender: str = Field(pattern=r"^(female|male|other|prefer_not_to_say)$")
-    class_name: str = Field(min_length=1, max_length=80)
-    academic_year: str = Field(min_length=4, max_length=32)
+    class_section_id: str | None = Field(default=None, min_length=32, max_length=32)
+    class_name: str | None = Field(default=None, min_length=1, max_length=80)
+    academic_year: str | None = Field(default=None, min_length=4, max_length=32)
+    admission_status: str = Field(default="new", pattern=r"^(new|in_review|accepted|enrolled|waitlist|withdrawn)$")
     guardian_name: str = Field(min_length=1, max_length=160)
     guardian_email: str | None = Field(default=None, max_length=254, pattern=EMAIL_PATTERN)
     guardian_phone: str = Field(min_length=1, max_length=32)
@@ -1407,6 +2041,13 @@ class StudentAdmission(BaseModel):
     def normalize_gender(cls, value: object) -> object:
         if isinstance(value, str):
             return value.strip().lower()
+        return value
+
+    @field_validator("admission_status", mode="before")
+    @classmethod
+    def normalize_admission_status(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip().lower() or "new"
         return value
 
     @field_validator("guardian_email", mode="before")
@@ -1435,8 +2076,10 @@ class StudentUpdate(BaseModel):
         default=None,
         pattern=r"^(female|male|other|prefer_not_to_say)$",
     )
+    class_section_id: str | None = Field(default=None, min_length=32, max_length=32)
     class_name: str | None = Field(default=None, min_length=1, max_length=80)
     academic_year: str | None = Field(default=None, min_length=4, max_length=32)
+    admission_status: str | None = Field(default=None, pattern=r"^(new|in_review|accepted|enrolled|waitlist|withdrawn)$")
     guardian_name: str | None = Field(default=None, min_length=1, max_length=160)
     guardian_email: str | None = Field(default=None, max_length=254, pattern=EMAIL_PATTERN)
     guardian_phone: str | None = Field(default=None, min_length=1, max_length=32)
@@ -1464,6 +2107,13 @@ class StudentUpdate(BaseModel):
             return value.strip().lower()
         return value
 
+    @field_validator("admission_status", mode="before")
+    @classmethod
+    def normalize_admission_status(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip().lower() or "new"
+        return value
+
     @field_validator("date_of_birth")
     @classmethod
     def reject_future_birth_date(cls, value: date | None) -> date | None:
@@ -1481,6 +2131,7 @@ class StudentResponse(BaseModel):
     gender: str
     class_name: str
     academic_year: str
+    admission_status: str
     guardian_name: str
     guardian_email: str | None
     guardian_phone: str
@@ -1498,11 +2149,47 @@ class StudentImportResponse(BaseModel):
     students: list[StudentResponse]
 
 
+class CampusCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    name: str = Field(min_length=1, max_length=160)
+    code: str = Field(min_length=2, max_length=32)
+    address: str | None = Field(default=None, max_length=255)
+    phone: str | None = Field(default=None, max_length=32)
+    email: str | None = Field(default=None, max_length=254)
+    is_primary: bool = False
+    status: Literal["active", "inactive"] = "active"
+
+
+class CampusResponse(BaseModel):
+    id: str
+    name: str
+    code: str
+    address: str | None
+    phone: str | None
+    email: str | None
+    is_primary: bool
+    status: str
+    created_at: datetime
+    updated_at: datetime
+
+
 class ClassSectionCreate(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     name: str = Field(min_length=1, max_length=80)
-    academic_year: str = Field(min_length=4, max_length=32)
+    academic_year_id: str | None = Field(default=None, min_length=32, max_length=32)
+    academic_year: str | None = Field(default=None, min_length=4, max_length=32)
+    campus_id: str | None = Field(default=None, min_length=32, max_length=32)
+
+
+class ClassSectionUpdate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    name: str | None = Field(default=None, min_length=1, max_length=80)
+    academic_year_id: str | None = Field(default=None, min_length=32, max_length=32)
+    campus_id: str | None = Field(default=None, max_length=32)
+    is_active: bool | None = None
 
 
 class AcademicYearCreate(BaseModel):
@@ -1512,6 +2199,15 @@ class AcademicYearCreate(BaseModel):
     start_date: date | None = None
     end_date: date | None = None
     is_current: bool = False
+
+
+class AcademicYearUpdate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    name: str | None = Field(default=None, min_length=4, max_length=32)
+    start_date: date | None = None
+    end_date: date | None = None
+    is_current: bool | None = None
 
 
 class AcademicYearResponse(BaseModel):
@@ -1562,6 +2258,259 @@ class ParentBillingSettingsResponse(BaseModel):
     provider: Literal["manual", "paystack", "stripe"]
     currency: str
     configured: bool
+
+
+class LibrarySettingsResponse(BaseModel):
+    id: str
+    daily_fine_rate: Decimal
+    currency: str
+    updated_at: datetime
+
+
+class LibraryBookResponse(BaseModel):
+    id: str
+    title: str
+    author: str
+    isbn: str | None
+    category: str | None
+    shelf_location: str | None
+    total_copies: int
+    available_copies: int
+    status: Literal["available", "archived"]
+    created_at: datetime
+    updated_at: datetime
+
+
+class LibraryBookListResponse(BaseModel):
+    items: list[LibraryBookResponse]
+    total: int
+
+
+class LibraryLoanResponse(BaseModel):
+    id: str
+    book_id: str
+    book_title: str
+    student_id: str
+    student_name: str
+    borrower_name: str
+    issued_by_user_id: str
+    checked_out_at: datetime
+    due_date: date
+    returned_at: datetime | None
+    status: Literal["active", "returned"]
+    fine_amount: Decimal
+    fine_currency: str
+    notes: str | None
+
+
+class LibraryLoanListResponse(BaseModel):
+    items: list[LibraryLoanResponse]
+    total: int
+
+
+class LibraryDashboardResponse(BaseModel):
+    total_books: int
+    available_books: int
+    active_loans: int
+    overdue_loans: int
+    total_fines_due: Decimal
+    currency: str
+    daily_fine_rate: Decimal
+
+
+class LibrarySettingsUpdate(BaseModel):
+    daily_fine_rate: Decimal = Field(ge=0, max_digits=8, decimal_places=2)
+    currency: str = Field(min_length=3, max_length=3, pattern=r"^[A-Za-z]{3}$")
+
+
+class LibraryBookCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    title: str = Field(min_length=1, max_length=180)
+    author: str = Field(min_length=1, max_length=160)
+    isbn: str | None = Field(default=None, min_length=1, max_length=32)
+    category: str | None = Field(default=None, min_length=1, max_length=80)
+    shelf_location: str | None = Field(default=None, min_length=1, max_length=120)
+    total_copies: int = Field(default=1, ge=1)
+
+
+class LibraryCheckoutRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    book_id: str = Field(min_length=32, max_length=32)
+    student_id: str = Field(min_length=32, max_length=32)
+    borrower_name: str = Field(min_length=1, max_length=180)
+    due_date: date
+    notes: str | None = Field(default=None, max_length=500)
+
+
+class TransportRouteResponse(BaseModel):
+    id: str
+    name: str
+    vehicle_number: str
+    driver_name: str
+    pickup_point: str
+    dropoff_point: str
+    capacity: int
+    status: Literal["active", "inactive"]
+    notes: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class TransportRouteListResponse(BaseModel):
+    items: list[TransportRouteResponse]
+    total: int
+
+
+class TransportRouteCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    name: str = Field(min_length=1, max_length=120)
+    vehicle_number: str = Field(min_length=1, max_length=48)
+    driver_name: str = Field(min_length=1, max_length=120)
+    pickup_point: str = Field(min_length=1, max_length=160)
+    dropoff_point: str = Field(min_length=1, max_length=160)
+    capacity: int = Field(default=1, ge=1)
+    notes: str | None = Field(default=None, max_length=500)
+
+
+class TransportAssignmentResponse(BaseModel):
+    id: str
+    route_id: str
+    route_name: str
+    student_id: str
+    student_name: str
+    pickup_point: str
+    dropoff_point: str
+    pickup_time: str | None
+    dropoff_time: str | None
+    status: Literal["assigned", "active", "inactive"]
+    notes: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class TransportAssignmentListResponse(BaseModel):
+    items: list[TransportAssignmentResponse]
+    total: int
+
+
+class TransportAssignmentCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    route_id: str = Field(min_length=32, max_length=32)
+    student_id: str = Field(min_length=32, max_length=32)
+    pickup_point: str = Field(min_length=1, max_length=160)
+    dropoff_point: str = Field(min_length=1, max_length=160)
+    pickup_time: str | None = Field(default=None, min_length=1, max_length=32)
+    dropoff_time: str | None = Field(default=None, min_length=1, max_length=32)
+    notes: str | None = Field(default=None, max_length=300)
+
+
+class TransportLogResponse(BaseModel):
+    id: str
+    route_id: str
+    route_name: str
+    student_id: str
+    student_name: str
+    event_type: Literal["pickup", "dropoff", "delay", "note"]
+    event_time: datetime
+    status: Literal["on_time", "late", "missed"]
+    note: str | None
+    created_by_user_id: str | None
+    created_at: datetime
+
+
+class TransportLogListResponse(BaseModel):
+    items: list[TransportLogResponse]
+    total: int
+
+
+class TransportLogCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    route_id: str = Field(min_length=32, max_length=32)
+    student_id: str = Field(min_length=32, max_length=32)
+    event_type: Literal["pickup", "dropoff", "delay", "note"]
+    status: Literal["on_time", "late", "missed"] = "on_time"
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class TransportDashboardResponse(BaseModel):
+    active_routes: int
+    assigned_students: int
+    upcoming_pickups: int
+    late_logs: int
+
+
+class BoardingRoomResponse(BaseModel):
+    id: str
+    name: str
+    room_type: Literal["single", "double", "dormitory"]
+    capacity: int
+    occupied_count: int
+    available_slots: int
+    monthly_fee: Decimal
+    status: Literal["available", "full", "maintenance"]
+    notes: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class BoardingRoomListResponse(BaseModel):
+    items: list[BoardingRoomResponse]
+    total: int
+
+
+class BoardingRoomCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    name: str = Field(min_length=1, max_length=120)
+    room_type: Literal["single", "double", "dormitory"] = "single"
+    capacity: int = Field(default=1, ge=1, le=40)
+    monthly_fee: Decimal = Field(gt=0, max_digits=10, decimal_places=2)
+    notes: str | None = Field(default=None, max_length=600)
+
+
+class BoardingAssignmentResponse(BaseModel):
+    id: str
+    room_id: str
+    room_name: str
+    student_id: str
+    student_name: str
+    bed_number: str | None
+    check_in_date: date
+    room_fee: Decimal
+    status: Literal["active", "pending", "left"]
+    notes: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class BoardingAssignmentListResponse(BaseModel):
+    items: list[BoardingAssignmentResponse]
+    total: int
+
+
+class BoardingAssignmentCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    room_id: str = Field(min_length=32, max_length=32)
+    student_id: str = Field(min_length=32, max_length=32)
+    bed_number: str | None = Field(default=None, min_length=1, max_length=24)
+    check_in_date: date = Field(default_factory=date.today)
+    room_fee: Decimal = Field(gt=0, max_digits=10, decimal_places=2)
+    notes: str | None = Field(default=None, max_length=600)
+
+
+class BoardingDashboardResponse(BaseModel):
+    total_rooms: int
+    total_capacity: int
+    occupied_rooms: int
+    available_slots: int
+    active_residents: int
+    monthly_revenue: Decimal
 
 
 class AnnouncementCreate(BaseModel):
@@ -1828,6 +2777,32 @@ class AnalyticsDashboardResponse(BaseModel):
     graded_count: int
 
 
+class CustomReportStudentRow(BaseModel):
+    student_id: str
+    student_name: str
+    admission_number: str
+    class_name: str
+    attendance_rate: Decimal | None
+    average_grade: Decimal | None
+    fees_outstanding: Decimal
+    fees_collected: Decimal
+    status: str
+
+
+class CustomReportSummary(BaseModel):
+    total_students: int
+    attendance_rate: Decimal
+    average_grade: Decimal | None
+    total_fees_collected: Decimal
+    total_fees_outstanding: Decimal
+    collection_rate: Decimal
+
+
+class CustomReportResponse(BaseModel):
+    summary: CustomReportSummary
+    rows: list[CustomReportStudentRow]
+
+
 class InvoiceGenerateResponse(BaseModel):
     created: int
     skipped: int
@@ -1857,6 +2832,8 @@ class ClassSectionResponse(BaseModel):
     name: str
     academic_year_id: str
     academic_year: str
+    campus_id: str | None = None
+    campus_name: str | None = None
     is_active: bool
     student_count: int
 
@@ -2055,6 +3032,72 @@ class StaffProfileResponse(BaseModel):
     contracts: list[StaffContractResponse]
 
 
+class PayrollEntryCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    staff_profile_id: str = Field(min_length=32, max_length=32)
+    base_salary: Decimal = Field(ge=0, max_digits=12, decimal_places=2)
+    allowances: Decimal = Field(default=Decimal("0"), ge=0, max_digits=12, decimal_places=2)
+    deductions: Decimal = Field(default=Decimal("0"), ge=0, max_digits=12, decimal_places=2)
+    notes: str | None = Field(default=None, max_length=500)
+
+
+class PayrollEntryResponse(BaseModel):
+    id: str
+    staff_profile_id: str
+    staff_name: str
+    base_salary: Decimal
+    allowances: Decimal
+    deductions: Decimal
+    net_pay: Decimal
+    status: Literal["draft", "approved", "paid"]
+    notes: str | None
+    created_at: datetime
+
+
+class PayrollRunCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    label: str = Field(min_length=1, max_length=120)
+    pay_period_start: date
+    pay_period_end: date
+    entries: list[PayrollEntryCreate] = Field(min_length=1, max_length=200)
+
+    @field_validator("pay_period_end")
+    @classmethod
+    def validate_payroll_period(cls, value: date, info: Any) -> date:
+        start_date = info.data.get("pay_period_start")
+        if start_date is not None and value < start_date:
+            raise ValueError("Payroll period end date cannot be before its start date")
+        return value
+
+
+class PayrollRunResponse(BaseModel):
+    id: str
+    label: str
+    pay_period_start: date
+    pay_period_end: date
+    status: Literal["draft", "approved", "paid"]
+    total_amount: Decimal
+    created_by_user_id: str | None
+    created_at: datetime
+    entries: list[PayrollEntryResponse]
+
+
+class PayrollRunListResponse(BaseModel):
+    items: list[PayrollRunResponse]
+    total: int
+
+
+class PayrollDashboardResponse(BaseModel):
+    total_runs: int
+    total_payroll: Decimal
+    paid_amount: Decimal
+    pending_amount: Decimal
+    active_staff: int
+    approved_entries: int
+
+
 class AssessmentCreate(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -2159,6 +3202,17 @@ class StudentReportCardResponse(BaseModel):
     subjects: list[ReportCardSubjectResult]
     overall_percentage: Decimal | None
     attendance: ReportCardAttendance
+    published_at: datetime | None
+
+
+class ReportCardPublishResponse(BaseModel):
+    class_section_id: str
+    term_id: str
+    published_at: datetime
+    already_published: bool
+    notifications_sent: int
+    notifications_failed: int
+    notifications_pending: int
 
 
 class ParentChildResponse(BaseModel):
@@ -2281,6 +3335,61 @@ class TeacherResponse(BaseModel):
     email: str
     is_active: bool
     class_section_ids: list[str]
+
+
+class LMSCourseCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=180)
+    description: str | None = Field(default=None, max_length=4000)
+    class_section_id: str | None = Field(default=None, min_length=32, max_length=32)
+    status: Literal["draft", "published"] = "draft"
+
+
+class LMSCourseResponse(BaseModel):
+    id: str
+    title: str
+    description: str | None
+    class_section_id: str | None
+    class_name: str | None
+    teacher_name: str | None
+    status: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class LMSAssignmentCreate(BaseModel):
+    course_id: str = Field(min_length=32, max_length=32)
+    title: str = Field(min_length=1, max_length=180)
+    instructions: str | None = Field(default=None, max_length=4000)
+    due_date: date | None = None
+    max_score: Decimal | None = Field(default=None, ge=0, max_digits=8, decimal_places=2)
+    status: Literal["draft", "published", "closed"] = "draft"
+
+
+class LMSAssignmentResponse(BaseModel):
+    id: str
+    course_id: str
+    course_title: str
+    title: str
+    instructions: str | None
+    due_date: date | None
+    max_score: Decimal | None
+    status: str
+    created_by_user_id: str
+    created_at: datetime
+    updated_at: datetime
+    submission_count: int
+
+
+class LMSSubmissionResponse(BaseModel):
+    id: str
+    assignment_id: str
+    student_id: str
+    student_name: str
+    status: Literal["pending", "submitted", "graded"]
+    submitted_at: datetime | None
+    score: Decimal | None
+    notes: str | None
+    updated_at: datetime
 
 
 class ActionMessage(BaseModel):
@@ -4033,6 +5142,225 @@ def create_app() -> FastAPI:
         )
 
     @app.get(
+        "/api/v1/reports/custom",
+        response_model=CustomReportResponse,
+        tags=["Analytics"],
+    )
+    async def get_custom_report(
+        _user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+        class_section_id: str | None = None,
+        student_id: str | None = None,
+        term_id: str | None = None,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> CustomReportResponse:
+        if start_date is not None and end_date is not None and start_date > end_date:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Start date must be earlier than or equal to the end date",
+            )
+
+        student_table, _year_table, class_table, enrollment_table = tenant_academic_tables(session)
+        attendance_table = tenant_attendance_table(session)
+        assessment_table, grade_table = tenant_assessment_tables(session)
+        _settings_table, _fee_table, invoice_table, payment_table = tenant_billing_tables(session)
+
+        filters: list[Any] = [student_table.c.is_active.is_(True)]
+        if class_section_id is not None:
+            filters.append(enrollment_table.c.class_section_id == class_section_id)
+        if student_id is not None:
+            filters.append(student_table.c.id == student_id)
+
+        student_result = await session.execute(
+            select(
+                student_table.c.id.label("student_id"),
+                student_table.c.first_name,
+                student_table.c.last_name,
+                student_table.c.admission_number,
+                class_table.c.name.label("class_name"),
+                enrollment_table.c.id.label("enrollment_id"),
+            )
+            .select_from(
+                enrollment_table.join(
+                    student_table,
+                    enrollment_table.c.student_id == student_table.c.id,
+                ).join(
+                    class_table,
+                    enrollment_table.c.class_section_id == class_table.c.id,
+                )
+            )
+            .where(*filters)
+            .order_by(student_table.c.last_name, student_table.c.first_name)
+        )
+        student_rows = student_result.mappings().all()
+
+        if not student_rows:
+            empty_summary = CustomReportSummary(
+                total_students=0,
+                attendance_rate=Decimal("0"),
+                average_grade=None,
+                total_fees_collected=Decimal("0"),
+                total_fees_outstanding=Decimal("0"),
+                collection_rate=Decimal("0"),
+            )
+            return CustomReportResponse(summary=empty_summary, rows=[])
+
+        enrollment_ids = [row["enrollment_id"] for row in student_rows]
+
+        attendance_filters: list[Any] = [attendance_table.c.enrollment_id.in_(enrollment_ids)]
+        if start_date is not None:
+            attendance_filters.append(attendance_table.c.attendance_date >= start_date)
+        if end_date is not None:
+            attendance_filters.append(attendance_table.c.attendance_date <= end_date)
+        attendance_result = await session.execute(
+            select(attendance_table.c.enrollment_id, attendance_table.c.status).where(*attendance_filters)
+        )
+        attendance_by_enrollment: defaultdict[str, list[str]] = defaultdict(list)
+        for row in attendance_result.mappings():
+            attendance_by_enrollment[str(row["enrollment_id"])].append(str(row["status"]))
+
+        grade_filters: list[Any] = [grade_table.c.enrollment_id.in_(enrollment_ids)]
+        if term_id is not None:
+            grade_filters.append(assessment_table.c.term_id == term_id)
+        grade_result = await session.execute(
+            select(
+                grade_table.c.enrollment_id,
+                grade_table.c.score,
+                assessment_table.c.max_score,
+            )
+            .select_from(
+                grade_table.join(
+                    assessment_table,
+                    grade_table.c.assessment_id == assessment_table.c.id,
+                )
+            )
+            .where(*grade_filters)
+        )
+        grade_scores_by_enrollment: defaultdict[str, list[tuple[Decimal, Decimal]]] = defaultdict(list)
+        for row in grade_result.mappings():
+            score = Decimal(str(row["score"]))
+            max_score = Decimal(str(row["max_score"]))
+            if max_score == 0:
+                continue
+            grade_scores_by_enrollment[str(row["enrollment_id"])].append((score, max_score))
+
+        invoice_filters: list[Any] = [invoice_table.c.enrollment_id.in_(enrollment_ids), invoice_table.c.voided_at.is_(None)]
+        if term_id is not None:
+            invoice_filters.append(invoice_table.c.term_id == term_id)
+        invoice_result = await session.execute(
+            select(
+                invoice_table.c.enrollment_id,
+                invoice_table.c.amount.label("invoiced_amount"),
+                payment_table.c.amount.label("paid_amount"),
+            )
+            .select_from(
+                invoice_table.outerjoin(
+                    payment_table,
+                    and_(invoice_table.c.id == payment_table.c.invoice_id, payment_table.c.voided_at.is_(None)),
+                )
+            )
+            .where(*invoice_filters)
+        )
+        invoice_totals: defaultdict[str, dict[str, Decimal]] = defaultdict(
+            lambda: {"invoiced": Decimal("0"), "paid": Decimal("0")}
+        )
+        for row in invoice_result.mappings():
+            key = str(row["enrollment_id"])
+            invoice_totals[key]["invoiced"] += Decimal(str(row["invoiced_amount"]))
+            if row["paid_amount"] is not None:
+                invoice_totals[key]["paid"] += Decimal(str(row["paid_amount"]))
+
+        report_rows: list[CustomReportStudentRow] = []
+        attendance_total = Decimal("0")
+        grade_total: Decimal | None = None
+        grade_count = 0
+        total_collected = Decimal("0")
+        total_outstanding = Decimal("0")
+
+        for row in student_rows:
+            enrollment_id = str(row["enrollment_id"])
+            statuses = attendance_by_enrollment.get(enrollment_id, [])
+            marked_count = len(statuses)
+            present_count = sum(1 for item in statuses if item == "present")
+            late_count = sum(1 for item in statuses if item == "late")
+            attendance_rate = (
+                (Decimal(present_count) + (Decimal(late_count) * Decimal("0.5")))
+                / Decimal(marked_count)
+                * Decimal("100")
+                if marked_count > 0
+                else Decimal("0")
+            )
+            attendance_total += attendance_rate
+
+            grade_values = grade_scores_by_enrollment.get(enrollment_id, [])
+            if grade_values:
+                calculated_grade = sum(
+                    (score / max_score) * Decimal("100")
+                    for score, max_score in grade_values
+                ) / Decimal(len(grade_values))
+                grade_total = (calculated_grade if grade_total is None else grade_total + calculated_grade)
+                grade_count += len(grade_values)
+            else:
+                calculated_grade = None
+
+            invoice_amounts = invoice_totals.get(enrollment_id, {"invoiced": Decimal("0"), "paid": Decimal("0")})
+            fees_outstanding = max(invoice_amounts["invoiced"] - invoice_amounts["paid"], Decimal("0"))
+            fees_collected = invoice_amounts["paid"]
+            total_outstanding += fees_outstanding
+            total_collected += fees_collected
+
+            if marked_count == 0 and (calculated_grade is None or calculated_grade <= Decimal("0")):
+                status = "No data"
+            elif attendance_rate >= Decimal("80") and (calculated_grade is None or calculated_grade >= Decimal("60")):
+                status = "On track"
+            elif attendance_rate >= Decimal("65") or (calculated_grade is not None and calculated_grade >= Decimal("50")):
+                status = "Watchlist"
+            else:
+                status = "At risk"
+
+            report_rows.append(
+                CustomReportStudentRow(
+                    student_id=str(row["student_id"]),
+                    student_name=f"{row['first_name']} {row['last_name']}".strip(),
+                    admission_number=str(row["admission_number"]),
+                    class_name=str(row["class_name"]),
+                    attendance_rate=attendance_rate,
+                    average_grade=calculated_grade,
+                    fees_outstanding=fees_outstanding,
+                    fees_collected=fees_collected,
+                    status=status,
+                )
+            )
+
+        average_attendance = (
+            attendance_total / Decimal(len(report_rows))
+            if report_rows
+            else Decimal("0")
+        )
+        average_grade_value = (
+            grade_total / Decimal(grade_count)
+            if grade_total is not None and grade_count > 0
+            else None
+        )
+        collection_total = total_collected + total_outstanding
+        collection_rate = (
+            (total_collected / collection_total) * Decimal("100")
+            if collection_total > 0
+            else Decimal("0")
+        )
+
+        summary = CustomReportSummary(
+            total_students=len(report_rows),
+            attendance_rate=average_attendance,
+            average_grade=average_grade_value,
+            total_fees_collected=total_collected,
+            total_fees_outstanding=total_outstanding,
+            collection_rate=collection_rate,
+        )
+        return CustomReportResponse(summary=summary, rows=report_rows)
+
+    @app.get(
         "/api/v1/billing/dashboard",
         response_model=BillingDashboardResponse,
         tags=["Billing"],
@@ -4720,6 +6048,1469 @@ def create_app() -> FastAPI:
         )
         announcement_row = announcement_result.mappings().one()
         return (await announcement_responses(session, [announcement_row]))[0]
+
+    @app.get(
+        "/api/v1/library/settings",
+        response_model=LibrarySettingsResponse,
+        tags=["Library"],
+    )
+    async def get_library_settings(
+        _user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> LibrarySettingsResponse:
+        settings_table, _book_table, _loan_table = tenant_library_tables(session)
+        row = (await session.execute(select(settings_table).limit(1))).mappings().one_or_none()
+        if row is None:
+            settings_id = uuid.uuid4().hex
+            await session.execute(
+                insert(settings_table).values(
+                    id=settings_id,
+                    daily_fine_rate=Decimal("0"),
+                    currency="NGN",
+                    updated_by_user_id=None,
+                    created_at=datetime.now(UTC),
+                    updated_at=datetime.now(UTC),
+                )
+            )
+            await session.commit()
+            row = (await session.execute(select(settings_table).where(settings_table.c.id == settings_id))).mappings().one()
+        return LibrarySettingsResponse(
+            id=row["id"],
+            daily_fine_rate=row["daily_fine_rate"],
+            currency=row["currency"],
+            updated_at=row["updated_at"],
+        )
+
+    @app.put(
+        "/api/v1/library/settings",
+        response_model=LibrarySettingsResponse,
+        tags=["Library"],
+    )
+    async def update_library_settings(
+        payload: LibrarySettingsUpdate,
+        user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> LibrarySettingsResponse:
+        settings_table, _book_table, _loan_table = tenant_library_tables(session)
+        row = (await session.execute(select(settings_table).limit(1))).mappings().one_or_none()
+        if row is None:
+            settings_id = uuid.uuid4().hex
+            await session.execute(
+                insert(settings_table).values(
+                    id=settings_id,
+                    daily_fine_rate=payload.daily_fine_rate,
+                    currency=payload.currency.upper(),
+                    updated_by_user_id=user.id,
+                    created_at=datetime.now(UTC),
+                    updated_at=datetime.now(UTC),
+                )
+            )
+            await session.commit()
+            row = (await session.execute(select(settings_table).where(settings_table.c.id == settings_id))).mappings().one()
+        else:
+            await session.execute(
+                update(settings_table)
+                .where(settings_table.c.id == row["id"])
+                .values(
+                    daily_fine_rate=payload.daily_fine_rate,
+                    currency=payload.currency.upper(),
+                    updated_by_user_id=user.id,
+                    updated_at=datetime.now(UTC),
+                )
+            )
+            await session.commit()
+            row = (await session.execute(select(settings_table).where(settings_table.c.id == row["id"]))).mappings().one()
+        return LibrarySettingsResponse(
+            id=row["id"],
+            daily_fine_rate=row["daily_fine_rate"],
+            currency=row["currency"],
+            updated_at=row["updated_at"],
+        )
+
+    @app.get(
+        "/api/v1/library/books",
+        response_model=LibraryBookListResponse,
+        tags=["Library"],
+    )
+    async def list_library_books(
+        _user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> LibraryBookListResponse:
+        book_table = tenant_library_tables(session)[1]
+        total_result = await session.execute(select(func.count()).select_from(book_table))
+        rows_result = await session.execute(
+            select(
+                book_table.c.id,
+                book_table.c.title,
+                book_table.c.author,
+                book_table.c.isbn,
+                book_table.c.category,
+                book_table.c.shelf_location,
+                book_table.c.total_copies,
+                book_table.c.available_copies,
+                book_table.c.status,
+                book_table.c.created_at,
+                book_table.c.updated_at,
+            )
+            .order_by(book_table.c.title.asc(), book_table.c.created_at.desc())
+        )
+        rows = rows_result.mappings().all()
+        return LibraryBookListResponse(
+            items=[
+                LibraryBookResponse(
+                    id=row["id"],
+                    title=row["title"],
+                    author=row["author"],
+                    isbn=row["isbn"],
+                    category=row["category"],
+                    shelf_location=row["shelf_location"],
+                    total_copies=row["total_copies"],
+                    available_copies=row["available_copies"],
+                    status=row["status"],
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"],
+                )
+                for row in rows
+            ],
+            total=int(total_result.scalar_one() or 0),
+        )
+
+    @app.post(
+        "/api/v1/library/books",
+        response_model=LibraryBookResponse,
+        status_code=status.HTTP_201_CREATED,
+        tags=["Library"],
+    )
+    async def create_library_book(
+        payload: LibraryBookCreate,
+        _user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> LibraryBookResponse:
+        book_table = tenant_library_tables(session)[1]
+        book_id = uuid.uuid4().hex
+        await session.execute(
+            insert(book_table).values(
+                id=book_id,
+                title=payload.title.strip(),
+                author=payload.author.strip(),
+                isbn=(payload.isbn or "").strip() or None,
+                category=(payload.category or "").strip() or None,
+                shelf_location=(payload.shelf_location or "").strip() or None,
+                total_copies=payload.total_copies,
+                available_copies=payload.total_copies,
+                status="available",
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+        )
+        await session.commit()
+        row = (await session.execute(select(book_table).where(book_table.c.id == book_id))).mappings().one()
+        return LibraryBookResponse(
+            id=row["id"],
+            title=row["title"],
+            author=row["author"],
+            isbn=row["isbn"],
+            category=row["category"],
+            shelf_location=row["shelf_location"],
+            total_copies=row["total_copies"],
+            available_copies=row["available_copies"],
+            status=row["status"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    @app.get(
+        "/api/v1/library/loans",
+        response_model=LibraryLoanListResponse,
+        tags=["Library"],
+    )
+    async def list_library_loans(
+        _user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> LibraryLoanListResponse:
+        _settings_table, book_table, loan_table = tenant_library_tables(session)
+        student_table = tenant_students_table(session)
+        total = await session.scalar(select(func.count()).select_from(loan_table))
+        rows = (await session.execute(
+            select(
+                loan_table.c.id,
+                loan_table.c.book_id,
+                loan_table.c.student_id,
+                loan_table.c.borrower_name,
+                loan_table.c.issued_by_user_id,
+                loan_table.c.checked_out_at,
+                loan_table.c.due_date,
+                loan_table.c.returned_at,
+                loan_table.c.status,
+                loan_table.c.fine_amount,
+                loan_table.c.fine_currency,
+                loan_table.c.notes,
+                book_table.c.title.label("book_title"),
+                student_table.c.first_name.label("student_first_name"),
+                student_table.c.last_name.label("student_last_name"),
+            )
+            .select_from(
+                loan_table.join(book_table, loan_table.c.book_id == book_table.c.id)
+                .join(student_table, loan_table.c.student_id == student_table.c.id)
+            )
+            .order_by(loan_table.c.checked_out_at.desc())
+        )).mappings().all()
+        return LibraryLoanListResponse(
+            items=[
+                LibraryLoanResponse(
+                    id=row["id"],
+                    book_id=row["book_id"],
+                    book_title=row["book_title"],
+                    student_id=row["student_id"],
+                    student_name=f"{row['student_first_name']} {row['student_last_name']}".strip(),
+                    borrower_name=row["borrower_name"],
+                    issued_by_user_id=row["issued_by_user_id"],
+                    checked_out_at=row["checked_out_at"],
+                    due_date=row["due_date"],
+                    returned_at=row["returned_at"],
+                    status=row["status"],
+                    fine_amount=row["fine_amount"],
+                    fine_currency=row["fine_currency"],
+                    notes=row["notes"],
+                )
+                for row in rows
+            ],
+            total=int(total or 0),
+        )
+
+    @app.get(
+        "/api/v1/library/dashboard",
+        response_model=LibraryDashboardResponse,
+        tags=["Library"],
+    )
+    async def get_library_dashboard(
+        _user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> LibraryDashboardResponse:
+        settings_table, book_table, loan_table = tenant_library_tables(session)
+        settings_row = (await session.execute(select(settings_table).limit(1))).mappings().one_or_none()
+        total_books = await session.scalar(select(func.count()).select_from(book_table)) or 0
+        available_books = await session.scalar(select(func.sum(book_table.c.available_copies)).select_from(book_table)) or 0
+        active_loans = await session.scalar(
+            select(func.count()).select_from(loan_table).where(loan_table.c.status == "active")
+        ) or 0
+        overdue_loans = await session.scalar(
+            select(func.count()).select_from(loan_table).where(
+                and_(loan_table.c.status == "active", loan_table.c.due_date < date.today())
+            )
+        ) or 0
+        total_fines_due = await session.scalar(
+            select(func.coalesce(func.sum(loan_table.c.fine_amount), Decimal("0"))).select_from(loan_table).where(loan_table.c.status == "active")
+        ) or Decimal("0")
+        currency = settings_row["currency"] if settings_row is not None else "NGN"
+        daily_fine_rate = settings_row["daily_fine_rate"] if settings_row is not None else Decimal("0")
+        return LibraryDashboardResponse(
+            total_books=int(total_books),
+            available_books=int(available_books),
+            active_loans=int(active_loans),
+            overdue_loans=int(overdue_loans),
+            total_fines_due=total_fines_due,
+            currency=currency,
+            daily_fine_rate=daily_fine_rate,
+        )
+
+    @app.post(
+        "/api/v1/library/loans",
+        response_model=LibraryLoanResponse,
+        status_code=status.HTTP_201_CREATED,
+        tags=["Library"],
+    )
+    async def create_library_loan(
+        payload: LibraryCheckoutRequest,
+        user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> LibraryLoanResponse:
+        if payload.due_date < date.today():
+            raise HTTPException(status_code=422, detail="Due date cannot be in the past")
+
+        settings_table, book_table, loan_table = tenant_library_tables(session)
+        student_table = tenant_students_table(session)
+        student = (await session.execute(select(student_table).where(student_table.c.id == payload.student_id))).mappings().one_or_none()
+        if student is None:
+            raise HTTPException(status_code=404, detail="Student not found")
+
+        book_row = (await session.execute(
+            select(book_table.c.id, book_table.c.available_copies, book_table.c.status)
+            .where(book_table.c.id == payload.book_id)
+        )).mappings().one_or_none()
+        if book_row is None:
+            raise HTTPException(status_code=404, detail="Book not found")
+        if book_row["available_copies"] < 1 or book_row["status"] == "archived":
+            raise HTTPException(status_code=409, detail="This book is currently unavailable")
+
+        settings_row = (await session.execute(select(settings_table).limit(1))).mappings().one_or_none()
+        currency = settings_row["currency"] if settings_row is not None else "NGN"
+        loan_id = uuid.uuid4().hex
+        await session.execute(
+            insert(loan_table).values(
+                id=loan_id,
+                book_id=payload.book_id,
+                student_id=payload.student_id,
+                borrower_name=payload.borrower_name.strip(),
+                issued_by_user_id=user.id,
+                checked_out_at=datetime.now(UTC),
+                due_date=payload.due_date,
+                returned_at=None,
+                status="active",
+                fine_amount=Decimal("0"),
+                fine_currency=currency,
+                notes=(payload.notes or "").strip() or None,
+                created_at=datetime.now(UTC),
+            )
+        )
+        await session.execute(
+            update(book_table)
+            .where(book_table.c.id == payload.book_id)
+            .values(available_copies=book_table.c.available_copies - 1, updated_at=datetime.now(UTC))
+        )
+        await session.commit()
+
+        row = (await session.execute(
+            select(
+                loan_table.c.id,
+                loan_table.c.book_id,
+                loan_table.c.student_id,
+                loan_table.c.borrower_name,
+                loan_table.c.issued_by_user_id,
+                loan_table.c.checked_out_at,
+                loan_table.c.due_date,
+                loan_table.c.returned_at,
+                loan_table.c.status,
+                loan_table.c.fine_amount,
+                loan_table.c.fine_currency,
+                loan_table.c.notes,
+                book_table.c.title.label("book_title"),
+                student_table.c.first_name.label("student_first_name"),
+                student_table.c.last_name.label("student_last_name"),
+            )
+            .select_from(
+                loan_table.join(book_table, loan_table.c.book_id == book_table.c.id)
+                .join(student_table, loan_table.c.student_id == student_table.c.id)
+            )
+            .where(loan_table.c.id == loan_id)
+        )).mappings().one()
+        return LibraryLoanResponse(
+            id=row["id"],
+            book_id=row["book_id"],
+            book_title=row["book_title"],
+            student_id=row["student_id"],
+            student_name=f"{row['student_first_name']} {row['student_last_name']}".strip(),
+            borrower_name=row["borrower_name"],
+            issued_by_user_id=row["issued_by_user_id"],
+            checked_out_at=row["checked_out_at"],
+            due_date=row["due_date"],
+            returned_at=row["returned_at"],
+            status=row["status"],
+            fine_amount=row["fine_amount"],
+            fine_currency=row["fine_currency"],
+            notes=row["notes"],
+        )
+
+    @app.post(
+        "/api/v1/library/loans/{loan_id}/return",
+        response_model=LibraryLoanResponse,
+        tags=["Library"],
+    )
+    async def return_library_loan(
+        loan_id: str,
+        _user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> LibraryLoanResponse:
+        settings_table, book_table, loan_table = tenant_library_tables(session)
+        student_table = tenant_students_table(session)
+        row = (await session.execute(
+            select(
+                loan_table.c.id,
+                loan_table.c.book_id,
+                loan_table.c.student_id,
+                loan_table.c.borrower_name,
+                loan_table.c.issued_by_user_id,
+                loan_table.c.checked_out_at,
+                loan_table.c.due_date,
+                loan_table.c.returned_at,
+                loan_table.c.status,
+                loan_table.c.fine_amount,
+                loan_table.c.fine_currency,
+                loan_table.c.notes,
+                book_table.c.title.label("book_title"),
+                student_table.c.first_name.label("student_first_name"),
+                student_table.c.last_name.label("student_last_name"),
+            )
+            .select_from(
+                loan_table.join(book_table, loan_table.c.book_id == book_table.c.id)
+                .join(student_table, loan_table.c.student_id == student_table.c.id)
+            )
+            .where(loan_table.c.id == loan_id)
+        )).mappings().one_or_none()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Loan not found")
+        if row["status"] == "returned":
+            return LibraryLoanResponse(
+                id=row["id"],
+                book_id=row["book_id"],
+                book_title=row["book_title"],
+                student_id=row["student_id"],
+                student_name=f"{row['student_first_name']} {row['student_last_name']}".strip(),
+                borrower_name=row["borrower_name"],
+                issued_by_user_id=row["issued_by_user_id"],
+                checked_out_at=row["checked_out_at"],
+                due_date=row["due_date"],
+                returned_at=row["returned_at"],
+                status=row["status"],
+                fine_amount=row["fine_amount"],
+                fine_currency=row["fine_currency"],
+                notes=row["notes"],
+            )
+
+        settings_row = (await session.execute(select(settings_table).limit(1))).mappings().one_or_none()
+        fine_rate = settings_row["daily_fine_rate"] if settings_row is not None else Decimal("0")
+        fine_currency = settings_row["currency"] if settings_row is not None else "NGN"
+        overdue_days = max(0, (date.today() - row["due_date"]).days)
+        fine_total = Decimal(overdue_days) * fine_rate
+        await session.execute(
+            update(loan_table)
+            .where(loan_table.c.id == loan_id)
+            .values(
+                status="returned",
+                returned_at=datetime.now(UTC),
+                fine_amount=fine_total,
+                fine_currency=fine_currency,
+            )
+        )
+        await session.execute(
+            update(book_table)
+            .where(book_table.c.id == row["book_id"])
+            .values(available_copies=book_table.c.available_copies + 1, updated_at=datetime.now(UTC))
+        )
+        await session.commit()
+        returned_row = (await session.execute(
+            select(
+                loan_table.c.id,
+                loan_table.c.book_id,
+                loan_table.c.student_id,
+                loan_table.c.borrower_name,
+                loan_table.c.issued_by_user_id,
+                loan_table.c.checked_out_at,
+                loan_table.c.due_date,
+                loan_table.c.returned_at,
+                loan_table.c.status,
+                loan_table.c.fine_amount,
+                loan_table.c.fine_currency,
+                loan_table.c.notes,
+                book_table.c.title.label("book_title"),
+                student_table.c.first_name.label("student_first_name"),
+                student_table.c.last_name.label("student_last_name"),
+            )
+            .select_from(
+                loan_table.join(book_table, loan_table.c.book_id == book_table.c.id)
+                .join(student_table, loan_table.c.student_id == student_table.c.id)
+            )
+            .where(loan_table.c.id == loan_id)
+        )).mappings().one()
+        return LibraryLoanResponse(
+            id=returned_row["id"],
+            book_id=returned_row["book_id"],
+            book_title=returned_row["book_title"],
+            student_id=returned_row["student_id"],
+            student_name=f"{returned_row['student_first_name']} {returned_row['student_last_name']}".strip(),
+            borrower_name=returned_row["borrower_name"],
+            issued_by_user_id=returned_row["issued_by_user_id"],
+            checked_out_at=returned_row["checked_out_at"],
+            due_date=returned_row["due_date"],
+            returned_at=returned_row["returned_at"],
+            status=returned_row["status"],
+            fine_amount=returned_row["fine_amount"],
+            fine_currency=returned_row["fine_currency"],
+            notes=returned_row["notes"],
+        )
+
+    @app.get(
+        "/api/v1/transport/routes",
+        response_model=TransportRouteListResponse,
+        tags=["Transport"],
+    )
+    async def list_transport_routes(
+        _user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> TransportRouteListResponse:
+        route_table, _assignment_table, _log_table = tenant_transport_tables(session)
+        total = await session.scalar(select(func.count()).select_from(route_table))
+        rows = (await session.execute(
+            select(
+                route_table.c.id,
+                route_table.c.name,
+                route_table.c.vehicle_number,
+                route_table.c.driver_name,
+                route_table.c.pickup_point,
+                route_table.c.dropoff_point,
+                route_table.c.capacity,
+                route_table.c.status,
+                route_table.c.notes,
+                route_table.c.created_at,
+                route_table.c.updated_at,
+            )
+            .order_by(route_table.c.name.asc(), route_table.c.created_at.desc())
+        )).mappings().all()
+        return TransportRouteListResponse(
+            items=[
+                TransportRouteResponse(
+                    id=row["id"],
+                    name=row["name"],
+                    vehicle_number=row["vehicle_number"],
+                    driver_name=row["driver_name"],
+                    pickup_point=row["pickup_point"],
+                    dropoff_point=row["dropoff_point"],
+                    capacity=row["capacity"],
+                    status=row["status"],
+                    notes=row["notes"],
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"],
+                )
+                for row in rows
+            ],
+            total=int(total or 0),
+        )
+
+    @app.post(
+        "/api/v1/transport/routes",
+        response_model=TransportRouteResponse,
+        status_code=status.HTTP_201_CREATED,
+        tags=["Transport"],
+    )
+    async def create_transport_route(
+        payload: TransportRouteCreate,
+        _user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> TransportRouteResponse:
+        route_table, _assignment_table, _log_table = tenant_transport_tables(session)
+        route_id = uuid.uuid4().hex
+        created_at = datetime.now(UTC)
+        await session.execute(
+            insert(route_table).values(
+                id=route_id,
+                name=payload.name.strip(),
+                vehicle_number=payload.vehicle_number.strip(),
+                driver_name=payload.driver_name.strip(),
+                pickup_point=payload.pickup_point.strip(),
+                dropoff_point=payload.dropoff_point.strip(),
+                capacity=payload.capacity,
+                status="active",
+                notes=payload.notes.strip() if payload.notes else None,
+                created_at=created_at,
+                updated_at=created_at,
+            )
+        )
+        await session.commit()
+        row = (await session.execute(select(route_table).where(route_table.c.id == route_id))).mappings().one()
+        return TransportRouteResponse(
+            id=row["id"],
+            name=row["name"],
+            vehicle_number=row["vehicle_number"],
+            driver_name=row["driver_name"],
+            pickup_point=row["pickup_point"],
+            dropoff_point=row["dropoff_point"],
+            capacity=row["capacity"],
+            status=row["status"],
+            notes=row["notes"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    @app.get(
+        "/api/v1/transport/assignments",
+        response_model=TransportAssignmentListResponse,
+        tags=["Transport"],
+    )
+    async def list_transport_assignments(
+        _user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> TransportAssignmentListResponse:
+        route_table, assignment_table, _log_table = tenant_transport_tables(session)
+        student_table = tenant_students_table(session)
+        total = await session.scalar(select(func.count()).select_from(assignment_table))
+        rows = (await session.execute(
+            select(
+                assignment_table.c.id,
+                assignment_table.c.route_id,
+                assignment_table.c.student_id,
+                assignment_table.c.pickup_point,
+                assignment_table.c.dropoff_point,
+                assignment_table.c.pickup_time,
+                assignment_table.c.dropoff_time,
+                assignment_table.c.status,
+                assignment_table.c.notes,
+                assignment_table.c.created_at,
+                assignment_table.c.updated_at,
+                route_table.c.name.label("route_name"),
+                student_table.c.first_name.label("student_first_name"),
+                student_table.c.last_name.label("student_last_name"),
+            )
+            .select_from(
+                assignment_table.join(route_table, assignment_table.c.route_id == route_table.c.id)
+                .join(student_table, assignment_table.c.student_id == student_table.c.id)
+            )
+            .order_by(assignment_table.c.created_at.desc())
+        )).mappings().all()
+        return TransportAssignmentListResponse(
+            items=[
+                TransportAssignmentResponse(
+                    id=row["id"],
+                    route_id=row["route_id"],
+                    route_name=row["route_name"],
+                    student_id=row["student_id"],
+                    student_name=f"{row['student_first_name']} {row['student_last_name']}".strip(),
+                    pickup_point=row["pickup_point"],
+                    dropoff_point=row["dropoff_point"],
+                    pickup_time=row["pickup_time"],
+                    dropoff_time=row["dropoff_time"],
+                    status=row["status"],
+                    notes=row["notes"],
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"],
+                )
+                for row in rows
+            ],
+            total=int(total or 0),
+        )
+
+    @app.post(
+        "/api/v1/transport/assignments",
+        response_model=TransportAssignmentResponse,
+        status_code=status.HTTP_201_CREATED,
+        tags=["Transport"],
+    )
+    async def create_transport_assignment(
+        payload: TransportAssignmentCreate,
+        _user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> TransportAssignmentResponse:
+        route_table, assignment_table, _log_table = tenant_transport_tables(session)
+        student_table = tenant_students_table(session)
+
+        route_row = (await session.execute(select(route_table).where(route_table.c.id == payload.route_id))).mappings().one_or_none()
+        if route_row is None:
+            raise HTTPException(status_code=404, detail="Transport route not found")
+        student_row = (await session.execute(select(student_table).where(student_table.c.id == payload.student_id))).mappings().one_or_none()
+        if student_row is None:
+            raise HTTPException(status_code=404, detail="Student not found")
+
+        active_count = await session.scalar(
+            select(func.count())
+            .select_from(assignment_table)
+            .where(
+                assignment_table.c.route_id == payload.route_id,
+                assignment_table.c.status.in_(["assigned", "active"]),
+            )
+        )
+        if (active_count or 0) >= int(route_row["capacity"]):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This route has reached its capacity")
+
+        assignment_id = uuid.uuid4().hex
+        created_at = datetime.now(UTC)
+        await session.execute(
+            insert(assignment_table).values(
+                id=assignment_id,
+                route_id=payload.route_id,
+                student_id=payload.student_id,
+                pickup_point=payload.pickup_point.strip(),
+                dropoff_point=payload.dropoff_point.strip(),
+                pickup_time=payload.pickup_time.strip() if payload.pickup_time else None,
+                dropoff_time=payload.dropoff_time.strip() if payload.dropoff_time else None,
+                status="assigned",
+                notes=payload.notes.strip() if payload.notes else None,
+                created_at=created_at,
+                updated_at=created_at,
+            )
+        )
+        await session.commit()
+        row = (await session.execute(
+            select(
+                assignment_table.c.id,
+                assignment_table.c.route_id,
+                assignment_table.c.student_id,
+                assignment_table.c.pickup_point,
+                assignment_table.c.dropoff_point,
+                assignment_table.c.pickup_time,
+                assignment_table.c.dropoff_time,
+                assignment_table.c.status,
+                assignment_table.c.notes,
+                assignment_table.c.created_at,
+                assignment_table.c.updated_at,
+                route_table.c.name.label("route_name"),
+                student_table.c.first_name.label("student_first_name"),
+                student_table.c.last_name.label("student_last_name"),
+            )
+            .select_from(
+                assignment_table.join(route_table, assignment_table.c.route_id == route_table.c.id)
+                .join(student_table, assignment_table.c.student_id == student_table.c.id)
+            )
+            .where(assignment_table.c.id == assignment_id)
+        )).mappings().one()
+        return TransportAssignmentResponse(
+            id=row["id"],
+            route_id=row["route_id"],
+            route_name=row["route_name"],
+            student_id=row["student_id"],
+            student_name=f"{row['student_first_name']} {row['student_last_name']}".strip(),
+            pickup_point=row["pickup_point"],
+            dropoff_point=row["dropoff_point"],
+            pickup_time=row["pickup_time"],
+            dropoff_time=row["dropoff_time"],
+            status=row["status"],
+            notes=row["notes"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    @app.get(
+        "/api/v1/transport/logs",
+        response_model=TransportLogListResponse,
+        tags=["Transport"],
+    )
+    async def list_transport_logs(
+        _user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> TransportLogListResponse:
+        route_table, _assignment_table, log_table = tenant_transport_tables(session)
+        student_table = tenant_students_table(session)
+        total = await session.scalar(select(func.count()).select_from(log_table))
+        rows = (await session.execute(
+            select(
+                log_table.c.id,
+                log_table.c.route_id,
+                log_table.c.student_id,
+                log_table.c.event_type,
+                log_table.c.event_time,
+                log_table.c.status,
+                log_table.c.note,
+                log_table.c.created_by_user_id,
+                log_table.c.created_at,
+                route_table.c.name.label("route_name"),
+                student_table.c.first_name.label("student_first_name"),
+                student_table.c.last_name.label("student_last_name"),
+            )
+            .select_from(
+                log_table.join(route_table, log_table.c.route_id == route_table.c.id)
+                .join(student_table, log_table.c.student_id == student_table.c.id)
+            )
+            .order_by(log_table.c.event_time.desc(), log_table.c.created_at.desc())
+        )).mappings().all()
+        return TransportLogListResponse(
+            items=[
+                TransportLogResponse(
+                    id=row["id"],
+                    route_id=row["route_id"],
+                    route_name=row["route_name"],
+                    student_id=row["student_id"],
+                    student_name=f"{row['student_first_name']} {row['student_last_name']}".strip(),
+                    event_type=row["event_type"],
+                    event_time=row["event_time"],
+                    status=row["status"],
+                    note=row["note"],
+                    created_by_user_id=row["created_by_user_id"],
+                    created_at=row["created_at"],
+                )
+                for row in rows
+            ],
+            total=int(total or 0),
+        )
+
+    @app.post(
+        "/api/v1/transport/logs",
+        response_model=TransportLogResponse,
+        status_code=status.HTTP_201_CREATED,
+        tags=["Transport"],
+    )
+    async def create_transport_log(
+        payload: TransportLogCreate,
+        user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> TransportLogResponse:
+        route_table, _assignment_table, log_table = tenant_transport_tables(session)
+        student_table = tenant_students_table(session)
+
+        route_row = (await session.execute(select(route_table).where(route_table.c.id == payload.route_id))).mappings().one_or_none()
+        if route_row is None:
+            raise HTTPException(status_code=404, detail="Transport route not found")
+        student_row = (await session.execute(select(student_table).where(student_table.c.id == payload.student_id))).mappings().one_or_none()
+        if student_row is None:
+            raise HTTPException(status_code=404, detail="Student not found")
+
+        log_id = uuid.uuid4().hex
+        created_at = datetime.now(UTC)
+        await session.execute(
+            insert(log_table).values(
+                id=log_id,
+                route_id=payload.route_id,
+                student_id=payload.student_id,
+                event_type=payload.event_type,
+                event_time=created_at,
+                status=payload.status,
+                note=payload.note.strip() if payload.note else None,
+                created_by_user_id=user.id,
+                created_at=created_at,
+            )
+        )
+        await session.commit()
+        row = (await session.execute(
+            select(
+                log_table.c.id,
+                log_table.c.route_id,
+                log_table.c.student_id,
+                log_table.c.event_type,
+                log_table.c.event_time,
+                log_table.c.status,
+                log_table.c.note,
+                log_table.c.created_by_user_id,
+                log_table.c.created_at,
+                route_table.c.name.label("route_name"),
+                student_table.c.first_name.label("student_first_name"),
+                student_table.c.last_name.label("student_last_name"),
+            )
+            .select_from(
+                log_table.join(route_table, log_table.c.route_id == route_table.c.id)
+                .join(student_table, log_table.c.student_id == student_table.c.id)
+            )
+            .where(log_table.c.id == log_id)
+        )).mappings().one()
+        return TransportLogResponse(
+            id=row["id"],
+            route_id=row["route_id"],
+            route_name=row["route_name"],
+            student_id=row["student_id"],
+            student_name=f"{row['student_first_name']} {row['student_last_name']}".strip(),
+            event_type=row["event_type"],
+            event_time=row["event_time"],
+            status=row["status"],
+            note=row["note"],
+            created_by_user_id=row["created_by_user_id"],
+            created_at=row["created_at"],
+        )
+
+    @app.get(
+        "/api/v1/transport/dashboard",
+        response_model=TransportDashboardResponse,
+        tags=["Transport"],
+    )
+    async def get_transport_dashboard(
+        _user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> TransportDashboardResponse:
+        route_table, assignment_table, log_table = tenant_transport_tables(session)
+        active_routes = await session.scalar(
+            select(func.count())
+            .select_from(route_table)
+            .where(route_table.c.status == "active")
+        )
+        assigned_students = await session.scalar(
+            select(func.count())
+            .select_from(assignment_table)
+            .where(assignment_table.c.status.in_(["assigned", "active"]))
+        )
+        upcoming_pickups = await session.scalar(
+            select(func.count())
+            .select_from(assignment_table)
+            .where(
+                assignment_table.c.pickup_time.is_not(None),
+                assignment_table.c.status.in_(["assigned", "active"]),
+            )
+        )
+        late_logs = await session.scalar(
+            select(func.count())
+            .select_from(log_table)
+            .where(log_table.c.status == "late")
+        )
+        return TransportDashboardResponse(
+            active_routes=int(active_routes or 0),
+            assigned_students=int(assigned_students or 0),
+            upcoming_pickups=int(upcoming_pickups or 0),
+            late_logs=int(late_logs or 0),
+        )
+
+    @app.get(
+        "/api/v1/boarding/dashboard",
+        response_model=BoardingDashboardResponse,
+        tags=["Boarding"],
+    )
+    async def get_boarding_dashboard(
+        _user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> BoardingDashboardResponse:
+        room_table, assignment_table = tenant_boarding_tables(session)
+        room_rows = (await session.execute(select(room_table))).mappings().all()
+        total_rooms = len(room_rows)
+        total_capacity = sum(int(row["capacity"]) for row in room_rows)
+        active_residents = await session.scalar(
+            select(func.count())
+            .select_from(assignment_table)
+            .where(assignment_table.c.status == "active")
+        ) or 0
+        occupied_rooms = 0
+        available_slots = 0
+        monthly_revenue = Decimal("0")
+        for row in room_rows:
+            occupied_count = await session.scalar(
+                select(func.count())
+                .select_from(assignment_table)
+                .where(assignment_table.c.room_id == row["id"], assignment_table.c.status.in_(["active", "pending"]))
+            ) or 0
+            if occupied_count > 0:
+                occupied_rooms += 1
+            available_slots += max(int(row["capacity"]) - int(occupied_count), 0)
+        room_fee_rows = (await session.execute(
+            select(assignment_table.c.room_fee)
+            .where(assignment_table.c.status == "active")
+        )).scalars().all()
+        for item in room_fee_rows:
+            monthly_revenue += Decimal(str(item or "0"))
+        return BoardingDashboardResponse(
+            total_rooms=total_rooms,
+            total_capacity=total_capacity,
+            occupied_rooms=occupied_rooms,
+            available_slots=available_slots,
+            active_residents=int(active_residents),
+            monthly_revenue=monthly_revenue,
+        )
+
+    @app.get(
+        "/api/v1/boarding/rooms",
+        response_model=BoardingRoomListResponse,
+        tags=["Boarding"],
+    )
+    async def list_boarding_rooms(
+        _user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> BoardingRoomListResponse:
+        room_table, assignment_table = tenant_boarding_tables(session)
+        total = await session.scalar(select(func.count()).select_from(room_table))
+        rows = (await session.execute(
+            select(
+                room_table.c.id,
+                room_table.c.name,
+                room_table.c.room_type,
+                room_table.c.capacity,
+                room_table.c.monthly_fee,
+                room_table.c.status,
+                room_table.c.notes,
+                room_table.c.created_at,
+                room_table.c.updated_at,
+            )
+            .order_by(room_table.c.name.asc(), room_table.c.created_at.desc())
+        )).mappings().all()
+        items: list[BoardingRoomResponse] = []
+        for row in rows:
+            occupied_count = await session.scalar(
+                select(func.count())
+                .select_from(assignment_table)
+                .where(assignment_table.c.room_id == row["id"], assignment_table.c.status.in_(["active", "pending"]))
+            ) or 0
+            available_slots = max(int(row["capacity"]) - int(occupied_count), 0)
+            status = row["status"]
+            if status != "maintenance" and int(occupied_count) >= int(row["capacity"]):
+                status = "full"
+            elif status == "maintenance":
+                status = "maintenance"
+            else:
+                status = "available"
+            items.append(
+                BoardingRoomResponse(
+                    id=row["id"],
+                    name=row["name"],
+                    room_type=row["room_type"],
+                    capacity=int(row["capacity"]),
+                    occupied_count=int(occupied_count),
+                    available_slots=available_slots,
+                    monthly_fee=row["monthly_fee"],
+                    status=status,
+                    notes=row["notes"],
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"],
+                )
+            )
+        return BoardingRoomListResponse(items=items, total=int(total or 0))
+
+    @app.post(
+        "/api/v1/boarding/rooms",
+        response_model=BoardingRoomResponse,
+        status_code=status.HTTP_201_CREATED,
+        tags=["Boarding"],
+    )
+    async def create_boarding_room(
+        payload: BoardingRoomCreate,
+        _user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> BoardingRoomResponse:
+        room_table, _assignment_table = tenant_boarding_tables(session)
+        room_id = uuid.uuid4().hex
+        created_at = datetime.now(UTC)
+        await session.execute(
+            insert(room_table).values(
+                id=room_id,
+                name=payload.name.strip(),
+                room_type=payload.room_type,
+                capacity=payload.capacity,
+                monthly_fee=payload.monthly_fee,
+                status="available",
+                notes=payload.notes.strip() if payload.notes else None,
+                created_at=created_at,
+                updated_at=created_at,
+            )
+        )
+        await session.commit()
+        row = (await session.execute(select(room_table).where(room_table.c.id == room_id))).mappings().one()
+        return BoardingRoomResponse(
+            id=row["id"],
+            name=row["name"],
+            room_type=row["room_type"],
+            capacity=int(row["capacity"]),
+            occupied_count=0,
+            available_slots=int(row["capacity"]),
+            monthly_fee=row["monthly_fee"],
+            status=row["status"],
+            notes=row["notes"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    @app.get(
+        "/api/v1/boarding/assignments",
+        response_model=BoardingAssignmentListResponse,
+        tags=["Boarding"],
+    )
+    async def list_boarding_assignments(
+        _user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> BoardingAssignmentListResponse:
+        room_table, assignment_table = tenant_boarding_tables(session)
+        student_table = tenant_students_table(session)
+        total = await session.scalar(select(func.count()).select_from(assignment_table))
+        rows = (await session.execute(
+            select(
+                assignment_table.c.id,
+                assignment_table.c.room_id,
+                room_table.c.name.label("room_name"),
+                assignment_table.c.student_id,
+                student_table.c.first_name,
+                student_table.c.last_name,
+                assignment_table.c.bed_number,
+                assignment_table.c.check_in_date,
+                assignment_table.c.room_fee,
+                assignment_table.c.status,
+                assignment_table.c.notes,
+                assignment_table.c.created_at,
+                assignment_table.c.updated_at,
+            )
+            .select_from(
+                assignment_table.join(room_table, assignment_table.c.room_id == room_table.c.id)
+                .join(student_table, assignment_table.c.student_id == student_table.c.id)
+            )
+            .order_by(assignment_table.c.check_in_date.desc(), assignment_table.c.created_at.desc())
+        )).mappings().all()
+        items: list[BoardingAssignmentResponse] = []
+        for row in rows:
+            items.append(
+                BoardingAssignmentResponse(
+                    id=row["id"],
+                    room_id=row["room_id"],
+                    room_name=row["room_name"],
+                    student_id=row["student_id"],
+                    student_name=f"{row['first_name']} {row['last_name']}".strip(),
+                    bed_number=row["bed_number"],
+                    check_in_date=row["check_in_date"],
+                    room_fee=row["room_fee"],
+                    status=row["status"],
+                    notes=row["notes"],
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"],
+                )
+            )
+        return BoardingAssignmentListResponse(items=items, total=int(total or 0))
+
+    @app.post(
+        "/api/v1/boarding/assignments",
+        response_model=BoardingAssignmentResponse,
+        status_code=status.HTTP_201_CREATED,
+        tags=["Boarding"],
+    )
+    async def create_boarding_assignment(
+        payload: BoardingAssignmentCreate,
+        _user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> BoardingAssignmentResponse:
+        room_table, assignment_table = tenant_boarding_tables(session)
+        student_table = tenant_students_table(session)
+        room_row = (await session.execute(
+            select(room_table.c.id, room_table.c.capacity)
+            .where(room_table.c.id == payload.room_id)
+        )).mappings().one_or_none()
+        if room_row is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Boarding room not found")
+        student_row = (await session.execute(
+            select(student_table.c.id, student_table.c.first_name, student_table.c.last_name)
+            .where(student_table.c.id == payload.student_id)
+        )).mappings().one_or_none()
+        if student_row is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
+        occupied_count = await session.scalar(
+            select(func.count())
+            .select_from(assignment_table)
+            .where(assignment_table.c.room_id == payload.room_id, assignment_table.c.status.in_(["active", "pending"]))
+        ) or 0
+        if int(occupied_count) >= int(room_row["capacity"]):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This boarding room is already at capacity",
+            )
+        assignment_id = uuid.uuid4().hex
+        created_at = datetime.now(UTC)
+        await session.execute(
+            insert(assignment_table).values(
+                id=assignment_id,
+                room_id=payload.room_id,
+                student_id=payload.student_id,
+                bed_number=payload.bed_number.strip() if payload.bed_number else None,
+                check_in_date=payload.check_in_date,
+                room_fee=payload.room_fee,
+                status="active",
+                notes=payload.notes.strip() if payload.notes else None,
+                created_at=created_at,
+                updated_at=created_at,
+            )
+        )
+        await session.commit()
+        created = (await session.execute(
+            select(
+                assignment_table.c.id,
+                assignment_table.c.room_id,
+                room_table.c.name.label("room_name"),
+                assignment_table.c.student_id,
+                student_table.c.first_name,
+                student_table.c.last_name,
+                assignment_table.c.bed_number,
+                assignment_table.c.check_in_date,
+                assignment_table.c.room_fee,
+                assignment_table.c.status,
+                assignment_table.c.notes,
+                assignment_table.c.created_at,
+                assignment_table.c.updated_at,
+            )
+            .select_from(
+                assignment_table.join(room_table, assignment_table.c.room_id == room_table.c.id)
+                .join(student_table, assignment_table.c.student_id == student_table.c.id)
+            )
+            .where(assignment_table.c.id == assignment_id)
+        )).mappings().one()
+        return BoardingAssignmentResponse(
+            id=created["id"],
+            room_id=created["room_id"],
+            room_name=created["room_name"],
+            student_id=created["student_id"],
+            student_name=f"{created['first_name']} {created['last_name']}".strip(),
+            bed_number=created["bed_number"],
+            check_in_date=created["check_in_date"],
+            room_fee=created["room_fee"],
+            status=created["status"],
+            notes=created["notes"],
+            created_at=created["created_at"],
+            updated_at=created["updated_at"],
+        )
+
+    @app.get(
+        "/api/v1/payroll/dashboard",
+        response_model=PayrollDashboardResponse,
+        tags=["Payroll"],
+    )
+    async def get_payroll_dashboard(
+        _user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> PayrollDashboardResponse:
+        run_table, entry_table = tenant_payroll_tables(session)
+        staff_table, _, _ = tenant_staff_tables(session)
+
+        total_runs = await session.scalar(select(func.count()).select_from(run_table)) or 0
+        total_payroll = await session.scalar(
+            select(func.coalesce(func.sum(run_table.c.total_amount), Decimal("0")))
+            .select_from(run_table)
+        ) or Decimal("0")
+        paid_amount = await session.scalar(
+            select(func.coalesce(func.sum(entry_table.c.net_pay), Decimal("0")))
+            .select_from(entry_table)
+            .where(entry_table.c.status == "paid")
+        ) or Decimal("0")
+        pending_amount = await session.scalar(
+            select(func.coalesce(func.sum(entry_table.c.net_pay), Decimal("0")))
+            .select_from(entry_table)
+            .where(entry_table.c.status.in_(["draft", "approved"]))
+        ) or Decimal("0")
+        active_staff = await session.scalar(
+            select(func.count())
+            .select_from(staff_table)
+            .where(staff_table.c.status == "active")
+        ) or 0
+        approved_entries = await session.scalar(
+            select(func.count())
+            .select_from(entry_table)
+            .where(entry_table.c.status == "approved")
+        ) or 0
+
+        return PayrollDashboardResponse(
+            total_runs=int(total_runs),
+            total_payroll=Decimal(str(total_payroll)),
+            paid_amount=Decimal(str(paid_amount)),
+            pending_amount=Decimal(str(pending_amount)),
+            active_staff=int(active_staff),
+            approved_entries=int(approved_entries),
+        )
+
+    @app.get(
+        "/api/v1/payroll/runs",
+        response_model=PayrollRunListResponse,
+        tags=["Payroll"],
+    )
+    async def list_payroll_runs(
+        _user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> PayrollRunListResponse:
+        run_table, entry_table = tenant_payroll_tables(session)
+        staff_table, _, _ = tenant_staff_tables(session)
+
+        run_rows = (await session.execute(
+            select(
+                run_table.c.id,
+                run_table.c.label,
+                run_table.c.pay_period_start,
+                run_table.c.pay_period_end,
+                run_table.c.status,
+                run_table.c.total_amount,
+                run_table.c.created_by_user_id,
+                run_table.c.created_at,
+            )
+            .order_by(run_table.c.created_at.desc())
+        )).mappings().all()
+
+        run_ids = [row["id"] for row in run_rows]
+        entry_rows = [] if not run_ids else (await session.execute(
+            select(
+                entry_table.c.run_id,
+                entry_table.c.id,
+                entry_table.c.staff_profile_id,
+                entry_table.c.base_salary,
+                entry_table.c.allowances,
+                entry_table.c.deductions,
+                entry_table.c.net_pay,
+                entry_table.c.status,
+                entry_table.c.notes,
+                entry_table.c.created_at,
+                staff_table.c.first_name,
+                staff_table.c.last_name,
+            )
+            .select_from(entry_table.join(staff_table, entry_table.c.staff_profile_id == staff_table.c.id))
+            .where(entry_table.c.run_id.in_(run_ids))
+            .order_by(entry_table.c.created_at.asc())
+        )).mappings().all()
+
+        entries_by_run: dict[str, list[PayrollEntryResponse]] = {run_id: [] for run_id in run_ids}
+        for row in entry_rows:
+            entries_by_run.setdefault(row["run_id"], []).append(
+                PayrollEntryResponse(
+                    id=row["id"],
+                    staff_profile_id=row["staff_profile_id"],
+                    staff_name=f"{row['first_name']} {row['last_name']}".strip(),
+                    base_salary=row["base_salary"],
+                    allowances=row["allowances"],
+                    deductions=row["deductions"],
+                    net_pay=row["net_pay"],
+                    status=row["status"],
+                    notes=row["notes"],
+                    created_at=row["created_at"],
+                )
+            )
+
+        items = [
+            PayrollRunResponse(
+                id=row["id"],
+                label=row["label"],
+                pay_period_start=row["pay_period_start"],
+                pay_period_end=row["pay_period_end"],
+                status=row["status"],
+                total_amount=row["total_amount"],
+                created_by_user_id=row["created_by_user_id"],
+                created_at=row["created_at"],
+                entries=entries_by_run.get(row["id"], []),
+            )
+            for row in run_rows
+        ]
+        return PayrollRunListResponse(items=items, total=len(items))
+
+    @app.post(
+        "/api/v1/payroll/runs",
+        response_model=PayrollRunResponse,
+        status_code=status.HTTP_201_CREATED,
+        tags=["Payroll"],
+    )
+    async def create_payroll_run(
+        payload: PayrollRunCreate,
+        user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> PayrollRunResponse:
+        run_table, entry_table = tenant_payroll_tables(session)
+        staff_table, _, _ = tenant_staff_tables(session)
+
+        run_id = uuid.uuid4().hex
+        created_at = datetime.now(UTC)
+        total_amount = Decimal("0")
+        entries: list[PayrollEntryResponse] = []
+        entry_rows: list[dict[str, Any]] = []
+
+        for item in payload.entries:
+            staff_row = (await session.execute(
+                select(staff_table.c.id, staff_table.c.first_name, staff_table.c.last_name)
+                .where(staff_table.c.id == item.staff_profile_id)
+            )).mappings().one_or_none()
+            if staff_row is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Staff profile {item.staff_profile_id} was not found",
+                )
+
+            net_pay = item.base_salary + item.allowances - item.deductions
+            if net_pay < 0:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"Net pay for {staff_row['first_name']} {staff_row['last_name']} cannot be negative",
+                )
+
+            entry_id = uuid.uuid4().hex
+            total_amount += net_pay
+            entry_rows.append(
+                {
+                    "id": entry_id,
+                    "run_id": run_id,
+                    "staff_profile_id": item.staff_profile_id,
+                    "base_salary": item.base_salary,
+                    "allowances": item.allowances,
+                    "deductions": item.deductions,
+                    "net_pay": net_pay,
+                    "status": "draft",
+                    "notes": item.notes.strip() if item.notes else None,
+                    "created_at": created_at,
+                }
+            )
+            entries.append(
+                PayrollEntryResponse(
+                    id=entry_id,
+                    staff_profile_id=item.staff_profile_id,
+                    staff_name=f"{staff_row['first_name']} {staff_row['last_name']}".strip(),
+                    base_salary=item.base_salary,
+                    allowances=item.allowances,
+                    deductions=item.deductions,
+                    net_pay=net_pay,
+                    status="draft",
+                    notes=item.notes.strip() if item.notes else None,
+                    created_at=created_at,
+                )
+            )
+
+        await session.execute(
+            insert(run_table).values(
+                id=run_id,
+                label=payload.label.strip(),
+                pay_period_start=payload.pay_period_start,
+                pay_period_end=payload.pay_period_end,
+                status="draft",
+                total_amount=total_amount,
+                created_by_user_id=user.id,
+                created_at=created_at,
+            )
+        )
+        if entry_rows:
+            await session.execute(insert(entry_table).values(entry_rows))
+        await session.commit()
+
+        return PayrollRunResponse(
+            id=run_id,
+            label=payload.label.strip(),
+            pay_period_start=payload.pay_period_start,
+            pay_period_end=payload.pay_period_end,
+            status="draft",
+            total_amount=total_amount,
+            created_by_user_id=user.id,
+            created_at=created_at,
+            entries=entries,
+        )
+
+    @app.post(
+        "/api/v1/payroll/runs/{run_id}/approve",
+        response_model=PayrollRunResponse,
+        tags=["Payroll"],
+    )
+    async def approve_payroll_run(
+        run_id: str,
+        _user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> PayrollRunResponse:
+        run_table, entry_table = tenant_payroll_tables(session)
+        staff_table, _, _ = tenant_staff_tables(session)
+
+        run_row = (await session.execute(
+            select(run_table).where(run_table.c.id == run_id)
+        )).mappings().one_or_none()
+        if run_row is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Payroll run not found")
+
+        await session.execute(update(run_table).where(run_table.c.id == run_id).values(status="approved"))
+        await session.execute(update(entry_table).where(entry_table.c.run_id == run_id).values(status="approved"))
+        await session.commit()
+
+        rows = (await session.execute(
+            select(
+                entry_table.c.id,
+                entry_table.c.staff_profile_id,
+                entry_table.c.base_salary,
+                entry_table.c.allowances,
+                entry_table.c.deductions,
+                entry_table.c.net_pay,
+                entry_table.c.status,
+                entry_table.c.notes,
+                entry_table.c.created_at,
+                staff_table.c.first_name,
+                staff_table.c.last_name,
+            )
+            .select_from(entry_table.join(staff_table, entry_table.c.staff_profile_id == staff_table.c.id))
+            .where(entry_table.c.run_id == run_id)
+            .order_by(entry_table.c.created_at.asc())
+        )).mappings().all()
+
+        return PayrollRunResponse(
+            id=run_row["id"],
+            label=run_row["label"],
+            pay_period_start=run_row["pay_period_start"],
+            pay_period_end=run_row["pay_period_end"],
+            status="approved",
+            total_amount=run_row["total_amount"],
+            created_by_user_id=run_row["created_by_user_id"],
+            created_at=run_row["created_at"],
+            entries=[
+                PayrollEntryResponse(
+                    id=row["id"],
+                    staff_profile_id=row["staff_profile_id"],
+                    staff_name=f"{row['first_name']} {row['last_name']}".strip(),
+                    base_salary=row["base_salary"],
+                    allowances=row["allowances"],
+                    deductions=row["deductions"],
+                    net_pay=row["net_pay"],
+                    status=row["status"],
+                    notes=row["notes"],
+                    created_at=row["created_at"],
+                )
+                for row in rows
+            ],
+        )
 
     @app.get(
         "/api/v1/announcements",
@@ -6642,6 +9433,7 @@ def create_app() -> FastAPI:
             )
 
         results: list[AttendanceSyncResult] = []
+        previous_summaries: dict[str, tuple[int, int]] = {}
         now = datetime.now(UTC)
         try:
             for entry in payload.entries:
@@ -6687,6 +9479,13 @@ def create_app() -> FastAPI:
                         ),
                     )
 
+                if entry.student_id not in previous_summaries:
+                    previous_summaries[entry.student_id] = await get_attendance_summary(
+                        session,
+                        attendance_table,
+                        entry.student_id,
+                    )
+
                 statement = dialect_insert(attendance_table).values(
                     id=uuid.uuid4().hex,
                     student_id=entry.student_id,
@@ -6725,6 +9524,51 @@ def create_app() -> FastAPI:
                     )
                 )
 
+            attendance_alerts: list[tuple[str, str, str]] = []
+            for student_id, previous_summary in previous_summaries.items():
+                current_summary = await get_attendance_summary(
+                    session,
+                    attendance_table,
+                    student_id,
+                )
+                if not should_send_attendance_threshold_alert(
+                    previous_summary,
+                    current_summary,
+                ):
+                    continue
+                student_result = await session.execute(
+                    select(
+                        student_table.c.first_name,
+                        student_table.c.last_name,
+                        student_table.c.guardian_name,
+                        student_table.c.guardian_email,
+                    ).where(student_table.c.id == student_id)
+                )
+                student = student_result.mappings().one_or_none()
+                if student is None or not student["guardian_email"]:
+                    continue
+
+                attended_days, marked_days = current_summary
+                attendance_rate = (
+                    Decimal(attended_days) / Decimal(marked_days) * Decimal(100)
+                )
+                student_name = f"{student['first_name']} {student['last_name']}"
+                body = (
+                    f"Hello {student['guardian_name']},\n\n"
+                    f"{student_name}'s recorded attendance rate has fallen to "
+                    f"{attendance_rate:.1f}% over {marked_days} marked school days. "
+                    f"Northstar sends this alert when attendance drops below "
+                    f"{ATTENDANCE_ALERT_THRESHOLD:.0f}%. Please contact the school "
+                    "if you have questions.\n"
+                )
+                attendance_alerts.append(
+                    (
+                        student["guardian_email"],
+                        f"Attendance alert for {student_name}",
+                        body,
+                    )
+                )
+
             await session.commit()
         except HTTPException:
             await session.rollback()
@@ -6735,6 +9579,12 @@ def create_app() -> FastAPI:
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Attendance sync conflicts with an existing record",
             ) from error
+
+        for recipient, subject, body in attendance_alerts:
+            try:
+                await deliver_action_email(recipient, subject, body)
+            except (OSError, RuntimeError, smtplib.SMTPException, ValueError):
+                logger.exception("Could not deliver a parent attendance threshold alert")
         return AttendanceSyncResponse(results=results)
 
     @app.get(
@@ -6827,6 +9677,115 @@ def create_app() -> FastAPI:
             is_current=payload.is_current,
             class_count=0,
         )
+
+    @app.patch(
+        "/api/v1/academic-years/{academic_year_id}",
+        response_model=AcademicYearResponse,
+        tags=["Classes and enrollments"],
+    )
+    async def update_academic_year(
+        academic_year_id: str,
+        payload: AcademicYearUpdate,
+        user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> AcademicYearResponse:
+        del user
+        _, year_table, class_table, _ = tenant_academic_tables(session)
+        changes = payload.model_dump(exclude_unset=True)
+        if not changes:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="At least one academic year field must be provided",
+            )
+
+        current_result = await session.execute(
+            select(year_table).where(year_table.c.id == academic_year_id)
+        )
+        current = current_result.mappings().one_or_none()
+        if current is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Academic year not found",
+            )
+        start_date = changes.get("start_date", current["start_date"])
+        end_date = changes.get("end_date", current["end_date"])
+        if start_date is not None and end_date is not None and start_date >= end_date:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Academic year end date must be after its start date",
+            )
+
+        try:
+            if changes.get("is_current") is True:
+                await session.execute(
+                    update(year_table).where(
+                        year_table.c.id != academic_year_id
+                    ).values(is_current=False)
+                )
+            result = await session.execute(
+                update(year_table)
+                .where(year_table.c.id == academic_year_id)
+                .values(**changes)
+                .returning(year_table)
+            )
+            updated = dict(result.mappings().one())
+            class_count_result = await session.execute(
+                select(func.count()).select_from(class_table).where(
+                    class_table.c.academic_year_id == academic_year_id
+                )
+            )
+            await session.commit()
+        except IntegrityError as error:
+            await session.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="An academic year with this name already exists",
+            ) from error
+        return AcademicYearResponse(
+            **updated,
+            class_count=class_count_result.scalar_one(),
+        )
+
+    @app.delete(
+        "/api/v1/academic-years/{academic_year_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+        tags=["Classes and enrollments"],
+    )
+    async def delete_academic_year(
+        academic_year_id: str,
+        user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> None:
+        del user
+        _, year_table, class_table, _ = tenant_academic_tables(session)
+        term_table = tenant_academic_term_table(session)
+        exists_result = await session.execute(
+            select(year_table.c.id).where(year_table.c.id == academic_year_id)
+        )
+        if exists_result.scalar_one_or_none() is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Academic year not found",
+            )
+        class_count_result = await session.execute(
+            select(func.count()).select_from(class_table).where(
+                class_table.c.academic_year_id == academic_year_id
+            )
+        )
+        term_count_result = await session.execute(
+            select(func.count()).select_from(term_table).where(
+                term_table.c.academic_year_id == academic_year_id
+            )
+        )
+        if class_count_result.scalar_one() or term_count_result.scalar_one():
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Academic years with classes or terms cannot be deleted",
+            )
+        await session.execute(
+            year_table.delete().where(year_table.c.id == academic_year_id)
+        )
+        await session.commit()
 
     @app.get(
         "/api/v1/academic-years/{academic_year_id}/terms",
@@ -6933,6 +9892,92 @@ def create_app() -> FastAPI:
         )
 
     @app.get(
+        "/api/v1/campuses",
+        response_model=list[CampusResponse],
+        tags=["School administration"],
+    )
+    async def list_campuses(
+        user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> list[CampusResponse]:
+        del user
+        campus_table = tenant_campus_table(session)
+        rows = await session.execute(
+            select(
+                campus_table.c.id,
+                campus_table.c.name,
+                campus_table.c.code,
+                campus_table.c.address,
+                campus_table.c.phone,
+                campus_table.c.email,
+                campus_table.c.is_primary,
+                campus_table.c.status,
+                campus_table.c.created_at,
+                campus_table.c.updated_at,
+            )
+            .order_by(campus_table.c.is_primary.desc(), campus_table.c.name.asc())
+        )
+        return [CampusResponse(**dict(row)) for row in rows.mappings()]
+
+    @app.post(
+        "/api/v1/campuses",
+        response_model=CampusResponse,
+        status_code=status.HTTP_201_CREATED,
+        tags=["School administration"],
+    )
+    async def create_campus(
+        payload: CampusCreate,
+        user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> CampusResponse:
+        del user
+        campus_table = tenant_campus_table(session)
+        if payload.is_primary:
+            await session.execute(
+                update(campus_table).values(is_primary=False)
+            )
+
+        campus_id = uuid.uuid4().hex
+        now = datetime.now(UTC)
+        try:
+            await session.execute(
+                insert(campus_table).values(
+                    id=campus_id,
+                    name=payload.name.strip(),
+                    code=payload.code.strip(),
+                    address=payload.address.strip() if payload.address else None,
+                    phone=payload.phone.strip() if payload.phone else None,
+                    email=payload.email.strip() if payload.email else None,
+                    is_primary=payload.is_primary,
+                    status=payload.status,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            await session.commit()
+        except IntegrityError as error:
+            await session.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A campus with this code already exists",
+            ) from error
+        result = await session.execute(
+            select(
+                campus_table.c.id,
+                campus_table.c.name,
+                campus_table.c.code,
+                campus_table.c.address,
+                campus_table.c.phone,
+                campus_table.c.email,
+                campus_table.c.is_primary,
+                campus_table.c.status,
+                campus_table.c.created_at,
+                campus_table.c.updated_at,
+            ).where(campus_table.c.id == campus_id)
+        )
+        return CampusResponse(**dict(result.mappings().one()))
+
+    @app.get(
         "/api/v1/classes",
         response_model=list[ClassSectionResponse],
         tags=["Classes and enrollments"],
@@ -6944,12 +9989,15 @@ def create_app() -> FastAPI:
     ) -> list[ClassSectionResponse]:
         del user
         student_table, year_table, class_table, enrollment_table = tenant_academic_tables(session)
+        campus_table = tenant_campus_table(session)
         query = (
             select(
                 class_table.c.id,
                 class_table.c.name,
                 class_table.c.academic_year_id,
                 year_table.c.name.label("academic_year"),
+                class_table.c.campus_id,
+                campus_table.c.name.label("campus_name"),
                 class_table.c.is_active,
                 func.count(student_table.c.id).label("student_count"),
             )
@@ -6957,6 +10005,9 @@ def create_app() -> FastAPI:
                 class_table.join(
                     year_table,
                     class_table.c.academic_year_id == year_table.c.id,
+                ).outerjoin(
+                    campus_table,
+                    class_table.c.campus_id == campus_table.c.id,
                 ).outerjoin(
                     enrollment_table,
                     and_(
@@ -6976,6 +10027,8 @@ def create_app() -> FastAPI:
                 class_table.c.name,
                 class_table.c.academic_year_id,
                 year_table.c.name,
+                class_table.c.campus_id,
+                campus_table.c.name,
                 class_table.c.is_active,
             )
             .order_by(year_table.c.name.desc(), class_table.c.name)
@@ -7000,19 +10053,45 @@ def create_app() -> FastAPI:
         session: Annotated[AsyncSession, Depends(tenant_db)],
     ) -> ClassSectionResponse:
         del user
-        _, _, class_table, _ = tenant_academic_tables(session)
+        _, year_table, class_table, _ = tenant_academic_tables(session)
+        campus_table = tenant_campus_table(session)
         class_id = uuid.uuid4().hex
-        try:
-            academic_year_id = await ensure_academic_year(
-                session,
-                name=payload.academic_year,
+        year_query = select(year_table.c.id, year_table.c.name)
+        if payload.academic_year_id:
+            year_query = year_query.where(
+                year_table.c.id == payload.academic_year_id
             )
+        elif payload.academic_year:
+            year_query = year_query.where(year_table.c.name == payload.academic_year)
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Select an existing academic year",
+            )
+        year_result = await session.execute(year_query)
+        academic_year = year_result.mappings().one_or_none()
+        if academic_year is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Academic year not found",
+            )
+        if payload.campus_id:
+            campus_exists = await session.execute(
+                select(campus_table.c.id).where(campus_table.c.id == payload.campus_id)
+            )
+            if campus_exists.scalar_one_or_none() is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Campus not found",
+                )
+        try:
             result = await session.execute(
                 insert(class_table)
                 .values(
                     id=class_id,
                     name=payload.name,
-                    academic_year_id=academic_year_id,
+                    academic_year_id=academic_year["id"],
+                    campus_id=payload.campus_id,
                     is_active=True,
                 )
                 .returning(class_table)
@@ -7025,9 +10104,215 @@ def create_app() -> FastAPI:
                 detail="This class already exists for the academic year",
             ) from error
         response = dict(result.mappings().one())
-        response["academic_year"] = payload.academic_year
+        response["academic_year"] = academic_year["name"]
+        response["campus_id"] = payload.campus_id
+        response["campus_name"] = (
+            await session.execute(
+                select(campus_table.c.name).where(campus_table.c.id == payload.campus_id)
+            )
+        ).scalar_one_or_none() if payload.campus_id else None
         response["student_count"] = 0
         return ClassSectionResponse(**response)
+
+    @app.patch(
+        "/api/v1/classes/{class_section_id}",
+        response_model=ClassSectionResponse,
+        tags=["Classes and enrollments"],
+    )
+    async def update_class_section(
+        class_section_id: str,
+        payload: ClassSectionUpdate,
+        user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> ClassSectionResponse:
+        del user
+        student_table, year_table, class_table, enrollment_table = tenant_academic_tables(session)
+        campus_table = tenant_campus_table(session)
+        changes = payload.model_dump(exclude_unset=True)
+        if not changes:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="At least one class section field must be provided",
+            )
+        class_exists = await session.execute(
+            select(class_table.c.id).where(class_table.c.id == class_section_id)
+        )
+        if class_exists.scalar_one_or_none() is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Class section not found",
+            )
+        if "academic_year_id" in changes:
+            year_exists = await session.execute(
+                select(year_table.c.id).where(
+                    year_table.c.id == changes["academic_year_id"]
+                )
+            )
+            if year_exists.scalar_one_or_none() is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Academic year not found",
+                )
+        if changes.get("campus_id"):
+            campus_exists = await session.execute(
+                select(campus_table.c.id).where(
+                    campus_table.c.id == changes["campus_id"]
+                )
+            )
+            if campus_exists.scalar_one_or_none() is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Campus not found",
+                )
+
+        try:
+            await session.execute(
+                update(class_table)
+                .where(class_table.c.id == class_section_id)
+                .values(**changes)
+            )
+            result = await session.execute(
+                select(
+                    class_table.c.id,
+                    class_table.c.name,
+                    class_table.c.academic_year_id,
+                    year_table.c.name.label("academic_year"),
+                    class_table.c.campus_id,
+                    campus_table.c.name.label("campus_name"),
+                    class_table.c.is_active,
+                    func.count(student_table.c.id).label("student_count"),
+                )
+                .select_from(
+                    class_table.join(
+                        year_table,
+                        class_table.c.academic_year_id == year_table.c.id,
+                    )
+                    .outerjoin(
+                        campus_table,
+                        class_table.c.campus_id == campus_table.c.id,
+                    )
+                    .outerjoin(
+                        enrollment_table,
+                        and_(
+                            enrollment_table.c.class_section_id == class_table.c.id,
+                            enrollment_table.c.status == "active",
+                        ),
+                    )
+                    .outerjoin(
+                        student_table,
+                        and_(
+                            student_table.c.id == enrollment_table.c.student_id,
+                            student_table.c.is_active.is_(True),
+                        ),
+                    )
+                )
+                .where(class_table.c.id == class_section_id)
+                .group_by(
+                    class_table.c.id,
+                    class_table.c.name,
+                    class_table.c.academic_year_id,
+                    year_table.c.name,
+                    class_table.c.campus_id,
+                    campus_table.c.name,
+                    class_table.c.is_active,
+                )
+            )
+            response = dict(result.mappings().one())
+            await session.commit()
+        except IntegrityError as error:
+            await session.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This class already exists for the academic year",
+            ) from error
+        return ClassSectionResponse(**response)
+
+    @app.delete(
+        "/api/v1/classes/{class_section_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+        tags=["Classes and enrollments"],
+    )
+    async def delete_class_section(
+        class_section_id: str,
+        user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> None:
+        del user
+        _, _, class_table, enrollment_table = tenant_academic_tables(session)
+        attendance_table = tenant_attendance_table(session)
+        assessment_table, _ = tenant_assessment_tables(session)
+        teacher_assignment_table = tenant_teacher_assignment_table(session)
+        timetable_table = tenant_timetable_table(session)
+        course_table, _, _ = tenant_lms_tables(session)
+        class_exists = await session.execute(
+            select(class_table.c.id).where(class_table.c.id == class_section_id)
+        )
+        if class_exists.scalar_one_or_none() is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Class section not found",
+            )
+        dependent_tables = (
+            (enrollment_table, enrollment_table.c.class_section_id),
+            (attendance_table, attendance_table.c.class_section_id),
+            (assessment_table, assessment_table.c.class_section_id),
+            (teacher_assignment_table, teacher_assignment_table.c.class_section_id),
+            (timetable_table, timetable_table.c.class_section_id),
+            (course_table, course_table.c.class_section_id),
+        )
+        existing_table_names = await session.run_sync(
+            lambda sync_session: set(
+                sqlalchemy_inspect(sync_session.get_bind()).get_table_names()
+            )
+        )
+        for dependent_table, class_id_column in dependent_tables:
+            if dependent_table.name not in existing_table_names:
+                continue
+            dependency = await session.execute(
+                select(dependent_table.c.id)
+                .where(class_id_column == class_section_id)
+                .limit(1)
+            )
+            if dependency.scalar_one_or_none() is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Class sections with associated records cannot be deleted; archive the class instead",
+                )
+        try:
+            await session.execute(
+                class_table.delete().where(class_table.c.id == class_section_id)
+            )
+            await session.commit()
+        except IntegrityError as error:
+            await session.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Class sections with associated records cannot be deleted; archive the class instead",
+            ) from error
+
+    @app.patch(
+        "/api/v1/classes/{class_section_id}/archive",
+        status_code=status.HTTP_204_NO_CONTENT,
+        tags=["Classes and enrollments"],
+    )
+    async def archive_class_section(
+        class_section_id: str,
+        user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> None:
+        del user
+        _, _, class_table, _ = tenant_academic_tables(session)
+        result = await session.execute(
+            update(class_table)
+            .where(class_table.c.id == class_section_id)
+            .values(is_active=False)
+        )
+        if result.rowcount != 1:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Class section not found",
+            )
+        await session.commit()
 
     @app.get(
         "/api/v1/classes/{class_section_id}/assessments",
@@ -7525,6 +10810,17 @@ def create_app() -> FastAPI:
                 detail="Term not found for this class academic year",
             )
 
+        publication_table, _ = tenant_report_card_tables(session)
+        publication_result = await session.execute(
+            select(publication_table.c.published_at).where(
+                publication_table.c.class_section_id == class_section_id,
+                publication_table.c.term_id == term_id,
+            )
+        )
+        published_at = publication_result.scalar_one_or_none()
+        if user.role == "guardian" and published_at is None:
+            return []
+
         grade_rows = await session.execute(
             select(
                 student_table.c.id.label("student_id"),
@@ -7698,9 +10994,170 @@ def create_app() -> FastAPI:
                         marked_days=attendance_denominator + counts["excused"],
                         attendance_rate=attendance_rate,
                     ),
+                    published_at=published_at,
                 )
             )
         return report_cards
+
+    @app.post(
+        "/api/v1/classes/{class_section_id}/terms/{term_id}/report-cards/publish",
+        response_model=ReportCardPublishResponse,
+        status_code=status.HTTP_200_OK,
+        tags=["Report cards"],
+    )
+    async def publish_term_report_cards(
+        class_section_id: str,
+        term_id: str,
+        tenant: Annotated[Tenant, Depends(get_request_tenant)],
+        user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> ReportCardPublishResponse:
+        report_cards = await get_term_report_cards(
+            class_section_id,
+            term_id,
+            user,
+            session,
+        )
+        if not report_cards:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="There are no enrolled students with report cards to publish",
+            )
+
+        publication_table, notification_table = tenant_report_card_tables(session)
+        publication_result = await session.execute(
+            select(publication_table).where(
+                publication_table.c.class_section_id == class_section_id,
+                publication_table.c.term_id == term_id,
+            )
+        )
+        publication = publication_result.mappings().one_or_none()
+        already_published = publication is not None
+        if publication is None:
+            publication_id = uuid.uuid4().hex
+            published_at = datetime.now(UTC)
+            await session.execute(
+                insert(publication_table).values(
+                    id=publication_id,
+                    class_section_id=class_section_id,
+                    term_id=term_id,
+                    published_by_user_id=user.id,
+                    published_at=published_at,
+                )
+            )
+            student_ids = [card.student_id for card in report_cards]
+            student_table = tenant_students_table(session)
+            guardian_result = await session.execute(
+                select(
+                    student_table.c.id,
+                    student_table.c.guardian_email,
+                ).where(
+                    student_table.c.id.in_(student_ids),
+                    student_table.c.guardian_email.is_not(None),
+                )
+            )
+            notification_rows = [
+                {
+                    "id": uuid.uuid4().hex,
+                    "publication_id": publication_id,
+                    "student_id": row["id"],
+                    "recipient_email": row["guardian_email"],
+                    "status": "pending",
+                }
+                for row in guardian_result.mappings()
+            ]
+            if notification_rows:
+                await session.execute(insert(notification_table), notification_rows)
+            await session.commit()
+            publication = {
+                "id": publication_id,
+                "published_at": published_at,
+            }
+
+        pending_result = await session.execute(
+            select(notification_table).where(
+                notification_table.c.publication_id == publication["id"],
+                notification_table.c.status != "sent",
+            )
+        )
+        pending_notifications = pending_result.mappings().all()
+        card_by_student = {card.student_id: card for card in report_cards}
+        class_name = report_cards[0].class_name
+        academic_year = report_cards[0].academic_year
+        term_name = report_cards[0].term_name
+        parent_url = tenant_app_url(tenant.identifier, "/parent")
+
+        for notification in pending_notifications:
+            card = card_by_student.get(notification["student_id"])
+            if card is None:
+                logger.error(
+                    "Report-card notification refers to missing student %s",
+                    notification["student_id"],
+                )
+                await session.execute(
+                    update(notification_table)
+                    .where(notification_table.c.id == notification["id"])
+                    .values(status="failed", last_error="Report card is no longer available")
+                )
+                await session.commit()
+                continue
+            subject = f"{term_name} report card available for {card.first_name} {card.last_name}"
+            body = (
+                f"Hello,\n\n"
+                f"{card.first_name} {card.last_name}'s {term_name} report card for "
+                f"{academic_year} is now available in the {class_name} parent portal.\n\n"
+                f"View the report card:\n{parent_url}\n\n"
+                "Sign in with your guardian account to review the term results and attendance."
+            )
+            try:
+                await deliver_action_email(
+                    notification["recipient_email"],
+                    subject,
+                    body,
+                )
+            except (OSError, RuntimeError, smtplib.SMTPException, ValueError) as error:
+                logger.exception(
+                    "Could not deliver report-card notification for student %s",
+                    card.student_id,
+                )
+                await session.execute(
+                    update(notification_table)
+                    .where(notification_table.c.id == notification["id"])
+                    .values(status="failed", last_error=str(error)[:500])
+                )
+            else:
+                await session.execute(
+                    update(notification_table)
+                    .where(notification_table.c.id == notification["id"])
+                    .values(
+                        status="sent",
+                        last_error=None,
+                        sent_at=datetime.now(UTC),
+                    )
+                )
+            await session.commit()
+
+        delivery_result = await session.execute(
+            select(
+                notification_table.c.status,
+                func.count().label("count"),
+            )
+            .where(notification_table.c.publication_id == publication["id"])
+            .group_by(notification_table.c.status)
+        )
+        delivery_counts = {
+            row["status"]: row["count"]
+            for row in delivery_result.mappings()
+        }
+        return ReportCardPublishResponse(
+            class_section_id=class_section_id,
+            term_id=term_id,
+            published_at=publication["published_at"],
+            already_published=already_published,
+            notifications_sent=delivery_counts.get("sent", 0),
+            notifications_failed=delivery_counts.get("failed", 0),
+            notifications_pending=delivery_counts.get("pending", 0),
+        )
 
     @app.get(
         "/api/v1/parents/children",
@@ -7927,20 +11384,54 @@ def create_app() -> FastAPI:
     ) -> StudentResponse:
         del user
         table = tenant_students_table(session)
+        _, year_table, class_table, _ = tenant_academic_tables(session)
+        class_query = (
+            select(
+                class_table.c.id,
+                class_table.c.name,
+                year_table.c.name.label("academic_year"),
+            )
+            .select_from(
+                class_table.join(
+                    year_table,
+                    class_table.c.academic_year_id == year_table.c.id,
+                )
+            )
+            .where(class_table.c.is_active.is_(True))
+        )
+        if payload.class_section_id:
+            class_query = class_query.where(class_table.c.id == payload.class_section_id)
+        elif payload.class_name and payload.academic_year:
+            class_query = class_query.where(
+                class_table.c.name == payload.class_name,
+                year_table.c.name == payload.academic_year,
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Select an active class section for this student",
+            )
+        class_result = await session.execute(class_query)
+        class_row = class_result.mappings().one_or_none()
+        if class_row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="The selected class section does not exist or is inactive",
+            )
+
         values = payload.model_dump()
+        values.pop("class_section_id", None)
+        values["class_name"] = class_row["name"]
+        values["academic_year"] = class_row["academic_year"]
         values["id"] = uuid.uuid4().hex
         values["is_active"] = True
+        values["admission_status"] = values.get("admission_status", "new")
         try:
-            class_section_id = await ensure_class_section(
-                session,
-                name=payload.class_name,
-                academic_year=payload.academic_year,
-            )
             result = await session.execute(insert(table).values(**values).returning(table))
             await ensure_student_enrollment(
                 session,
                 student_id=values["id"],
-                class_section_id=class_section_id,
+                class_section_id=class_row["id"],
                 enrolled_at=date.today(),
             )
             await session.commit()
@@ -8045,6 +11536,39 @@ def create_app() -> FastAPI:
             )
 
         table = tenant_students_table(session)
+        _, year_table, class_table, _ = tenant_academic_tables(session)
+        existing_classes_result = await session.execute(
+            select(
+                class_table.c.id,
+                class_table.c.name,
+                year_table.c.name.label("academic_year"),
+            )
+            .select_from(
+                class_table.join(
+                    year_table,
+                    class_table.c.academic_year_id == year_table.c.id,
+                )
+            )
+            .where(class_table.c.is_active.is_(True))
+        )
+        class_ids = {
+            (row["name"], row["academic_year"]): row["id"]
+            for row in existing_classes_result.mappings()
+        }
+        missing_classes = [
+            f"{payload.class_name} · {payload.academic_year}"
+            for payload in payloads
+            if (payload.class_name, payload.academic_year) not in class_ids
+        ]
+        if missing_classes:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "message": "CSV rows must reference existing active class sections",
+                    "classes": sorted(set(missing_classes)),
+                },
+            )
+
         existing_result = await session.execute(
             select(table.c.admission_number).where(
                 table.c.admission_number.in_(admission_numbers)
@@ -8057,23 +11581,31 @@ def create_app() -> FastAPI:
             )
 
         values = []
+        student_class_ids: dict[str, str] = {}
         for payload in payloads:
             student_values = payload.model_dump()
+            student_values.pop("class_section_id", None)
+            student_values["class_section_id"] = class_ids[
+                (payload.class_name, payload.academic_year)
+            ]
+            student_values["class_name"] = payload.class_name
+            student_values["academic_year"] = payload.academic_year
             student_values["id"] = uuid.uuid4().hex
             student_values["is_active"] = True
+            student_values["admission_status"] = (
+                student_values.get("admission_status") or "new"
+            )
+            student_class_ids[student_values["id"]] = student_values.pop(
+                "class_section_id"
+            )
             values.append(student_values)
         try:
             result = await session.execute(insert(table).returning(table), values)
             for student_values in values:
-                class_section_id = await ensure_class_section(
-                    session,
-                    name=student_values["class_name"],
-                    academic_year=student_values["academic_year"],
-                )
                 await ensure_student_enrollment(
                     session,
                     student_id=student_values["id"],
-                    class_section_id=class_section_id,
+                    class_section_id=student_class_ids[student_values["id"]],
                     enrolled_at=date.today(),
                 )
             await session.commit()
@@ -8125,6 +11657,7 @@ def create_app() -> FastAPI:
                 detail="At least one student field must be provided",
             )
         table = tenant_students_table(session)
+        _, year_table, class_table, _ = tenant_academic_tables(session)
         try:
             existing_result = await session.execute(
                 select(table.c.class_name, table.c.academic_year).where(
@@ -8137,6 +11670,49 @@ def create_app() -> FastAPI:
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail="Student not found",
                 )
+
+            selected_class_id = changes.pop("class_section_id", None)
+            class_requested = selected_class_id is not None or (
+                "class_name" in changes or "academic_year" in changes
+            )
+            target_class_id: str | None = None
+            if class_requested:
+                class_query = (
+                    select(
+                        class_table.c.id,
+                        class_table.c.name,
+                        year_table.c.name.label("academic_year"),
+                    )
+                    .select_from(
+                        class_table.join(
+                            year_table,
+                            class_table.c.academic_year_id == year_table.c.id,
+                        )
+                    )
+                    .where(class_table.c.is_active.is_(True))
+                )
+                if selected_class_id:
+                    class_query = class_query.where(
+                        class_table.c.id == selected_class_id
+                    )
+                else:
+                    class_query = class_query.where(
+                        class_table.c.name
+                        == changes.get("class_name", existing["class_name"]),
+                        year_table.c.name
+                        == changes.get("academic_year", existing["academic_year"]),
+                    )
+                selected_class_result = await session.execute(class_query)
+                selected_class = selected_class_result.mappings().one_or_none()
+                if selected_class is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="The selected class section does not exist or is inactive",
+                    )
+                target_class_id = selected_class["id"]
+                changes["class_name"] = selected_class["name"]
+                changes["academic_year"] = selected_class["academic_year"]
+
             result = await session.execute(
                 update(table)
                 .where(table.c.id == student_id)
@@ -8151,19 +11727,14 @@ def create_app() -> FastAPI:
                     detail="Student not found",
                 )
             updated = dict(row)
-            if (
+            if target_class_id is not None and (
                 updated["class_name"] != existing["class_name"]
                 or updated["academic_year"] != existing["academic_year"]
             ):
-                class_section_id = await ensure_class_section(
-                    session,
-                    name=updated["class_name"],
-                    academic_year=updated["academic_year"],
-                )
                 await ensure_student_enrollment(
                     session,
                     student_id=student_id,
-                    class_section_id=class_section_id,
+                    class_section_id=target_class_id,
                     enrolled_at=date.today(),
                 )
             await session.commit()
@@ -8269,6 +11840,7 @@ def create_app() -> FastAPI:
             .values(
                 class_name=class_row["name"],
                 academic_year=class_row["academic_year"],
+                admission_status="enrolled",
             )
         )
         await session.commit()
@@ -8331,6 +11903,285 @@ def create_app() -> FastAPI:
             .values(password_hash=password_hasher.hash(payload.new_password))
         )
         await session.commit()
+
+    @app.get(
+        "/api/v1/lms/courses",
+        response_model=list[LMSCourseResponse],
+        tags=["Learning"],
+    )
+    async def list_learning_courses(
+        user: Annotated[TenantUser, Depends(require_school_user)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> list[LMSCourseResponse]:
+        del user
+        course_table, _, _ = tenant_lms_tables(session)
+        user_table = tenant_users_table(session)
+        _, _, class_table, _ = tenant_academic_tables(session)
+        rows = await session.execute(
+            select(
+                course_table.c.id,
+                course_table.c.title,
+                course_table.c.description,
+                course_table.c.class_section_id,
+                class_table.c.name.label("class_name"),
+                user_table.c.email.label("teacher_name"),
+                course_table.c.status,
+                course_table.c.created_at,
+                course_table.c.updated_at,
+            )
+            .select_from(
+                course_table.outerjoin(
+                    class_table,
+                    course_table.c.class_section_id == class_table.c.id,
+                ).join(
+                    user_table,
+                    course_table.c.teacher_user_id == user_table.c.id,
+                )
+            )
+            .order_by(course_table.c.updated_at.desc(), course_table.c.title)
+        )
+        return [LMSCourseResponse(**dict(row)) for row in rows.mappings()]
+
+    @app.post(
+        "/api/v1/lms/courses",
+        response_model=LMSCourseResponse,
+        status_code=status.HTTP_201_CREATED,
+        tags=["Learning"],
+    )
+    async def create_learning_course(
+        payload: LMSCourseCreate,
+        user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> LMSCourseResponse:
+        course_table, _, _ = tenant_lms_tables(session)
+        user_table = tenant_users_table(session)
+        _, _, class_table, _ = tenant_academic_tables(session)
+        if payload.class_section_id is not None:
+            class_row = await session.execute(
+                select(class_table.c.id).where(class_table.c.id == payload.class_section_id)
+            )
+            if class_row.scalar_one_or_none() is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Class section not found",
+                )
+
+        course_id = uuid.uuid4().hex
+        now = datetime.now(UTC)
+        await session.execute(
+            insert(course_table).values(
+                id=course_id,
+                title=payload.title.strip(),
+                description=payload.description.strip() if payload.description else None,
+                class_section_id=payload.class_section_id,
+                teacher_user_id=user.id,
+                status=payload.status,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await session.commit()
+        row = await session.execute(
+            select(
+                course_table.c.id,
+                course_table.c.title,
+                course_table.c.description,
+                course_table.c.class_section_id,
+                class_table.c.name.label("class_name"),
+                user_table.c.email.label("teacher_name"),
+                course_table.c.status,
+                course_table.c.created_at,
+                course_table.c.updated_at,
+            )
+            .select_from(
+                course_table.outerjoin(
+                    class_table,
+                    course_table.c.class_section_id == class_table.c.id,
+                ).join(
+                    user_table,
+                    course_table.c.teacher_user_id == user_table.c.id,
+                )
+            )
+            .where(course_table.c.id == course_id)
+        )
+        result = row.mappings().one()
+        return LMSCourseResponse(**dict(result))
+
+    @app.get(
+        "/api/v1/lms/assignments",
+        response_model=list[LMSAssignmentResponse],
+        tags=["Learning"],
+    )
+    async def list_learning_assignments(
+        user: Annotated[TenantUser, Depends(require_school_user)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> list[LMSAssignmentResponse]:
+        del user
+        _, assignment_table, submission_table = tenant_lms_tables(session)
+        course_table = tenant_lms_tables(session)[0]
+        rows = await session.execute(
+            select(
+                assignment_table.c.id,
+                assignment_table.c.course_id,
+                course_table.c.title.label("course_title"),
+                assignment_table.c.title,
+                assignment_table.c.instructions,
+                assignment_table.c.due_date,
+                assignment_table.c.max_score,
+                assignment_table.c.status,
+                assignment_table.c.created_by_user_id,
+                assignment_table.c.created_at,
+                assignment_table.c.updated_at,
+                func.count(submission_table.c.id).label("submission_count"),
+            )
+            .select_from(
+                assignment_table.join(
+                    course_table,
+                    assignment_table.c.course_id == course_table.c.id,
+                ).outerjoin(
+                    submission_table,
+                    assignment_table.c.id == submission_table.c.assignment_id,
+                )
+            )
+            .group_by(
+                assignment_table.c.id,
+                assignment_table.c.course_id,
+                course_table.c.title,
+                assignment_table.c.title,
+                assignment_table.c.instructions,
+                assignment_table.c.due_date,
+                assignment_table.c.max_score,
+                assignment_table.c.status,
+                assignment_table.c.created_by_user_id,
+                assignment_table.c.created_at,
+                assignment_table.c.updated_at,
+            )
+            .order_by(assignment_table.c.due_date.is_(None), assignment_table.c.due_date.asc(), assignment_table.c.updated_at.desc())
+        )
+        return [LMSAssignmentResponse(**dict(row), submission_count=int(row["submission_count"] or 0)) for row in rows.mappings()]
+
+    @app.post(
+        "/api/v1/lms/assignments",
+        response_model=LMSAssignmentResponse,
+        status_code=status.HTTP_201_CREATED,
+        tags=["Learning"],
+    )
+    async def create_learning_assignment(
+        payload: LMSAssignmentCreate,
+        user: Annotated[TenantUser, Depends(require_school_admin)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> LMSAssignmentResponse:
+        course_table, assignment_table, _ = tenant_lms_tables(session)
+        course_result = await session.execute(
+            select(course_table.c.id, course_table.c.title).where(course_table.c.id == payload.course_id)
+        )
+        course = course_result.mappings().one_or_none()
+        if course is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Learning course not found",
+            )
+
+        assignment_id = uuid.uuid4().hex
+        now = datetime.now(UTC)
+        await session.execute(
+            insert(assignment_table).values(
+                id=assignment_id,
+                course_id=payload.course_id,
+                title=payload.title.strip(),
+                instructions=payload.instructions.strip() if payload.instructions else None,
+                due_date=payload.due_date,
+                max_score=payload.max_score,
+                status=payload.status,
+                created_by_user_id=user.id,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await session.commit()
+        row = await session.execute(
+            select(
+                assignment_table.c.id,
+                assignment_table.c.course_id,
+                course_table.c.title.label("course_title"),
+                assignment_table.c.title,
+                assignment_table.c.instructions,
+                assignment_table.c.due_date,
+                assignment_table.c.max_score,
+                assignment_table.c.status,
+                assignment_table.c.created_by_user_id,
+                assignment_table.c.created_at,
+                assignment_table.c.updated_at,
+                func.count().over().label("submission_count"),
+            )
+            .select_from(
+                assignment_table.join(
+                    course_table,
+                    assignment_table.c.course_id == course_table.c.id,
+                )
+            )
+            .where(assignment_table.c.id == assignment_id)
+        )
+        result = row.mappings().one()
+        return LMSAssignmentResponse(**dict(result), submission_count=0)
+
+    @app.get(
+        "/api/v1/lms/assignments/{assignment_id}/submissions",
+        response_model=list[LMSSubmissionResponse],
+        tags=["Learning"],
+    )
+    async def list_learning_submissions(
+        assignment_id: str,
+        user: Annotated[TenantUser, Depends(require_school_user)],
+        session: Annotated[AsyncSession, Depends(tenant_db)],
+    ) -> list[LMSSubmissionResponse]:
+        del user
+        _, assignment_table, submission_table = tenant_lms_tables(session)
+        student_table = tenant_students_table(session)
+        assignment_result = await session.execute(
+            select(assignment_table.c.id).where(assignment_table.c.id == assignment_id)
+        )
+        if assignment_result.scalar_one_or_none() is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Assignment not found",
+            )
+        rows = await session.execute(
+            select(
+                submission_table.c.id,
+                submission_table.c.assignment_id,
+                submission_table.c.student_id,
+                student_table.c.first_name,
+                student_table.c.last_name,
+                submission_table.c.status,
+                submission_table.c.submitted_at,
+                submission_table.c.score,
+                submission_table.c.notes,
+                submission_table.c.updated_at,
+            )
+            .select_from(
+                submission_table.join(
+                    student_table,
+                    submission_table.c.student_id == student_table.c.id,
+                )
+            )
+            .where(submission_table.c.assignment_id == assignment_id)
+            .order_by(submission_table.c.updated_at.desc())
+        )
+        return [
+            LMSSubmissionResponse(
+                id=row[0],
+                assignment_id=row[1],
+                student_id=row[2],
+                student_name=f"{row[3]} {row[4]}".strip(),
+                status=row[5],
+                submitted_at=row[6],
+                score=row[7],
+                notes=row[8],
+                updated_at=row[9],
+            )
+            for row in rows
+        ]
 
     return app
 

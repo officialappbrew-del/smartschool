@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useState } from "react";
 import type { FormEvent } from "react";
 import FeedbackModal from "./FeedbackModal";
+import PasswordInput from "./PasswordInput";
 import { tenantApiUrl } from "../lib/tenant-api";
 
 type AuthMode = "accept-invitation" | "login" | "request-reset" | "reset-password";
@@ -105,11 +106,7 @@ export default function SchoolAuthForm({ mode, token = "" }: SchoolAuthFormProps
         }
         window.sessionStorage.setItem("northstar_access_token", result.access_token);
         window.location.assign(
-          result.role === "guardian"
-            ? "/parent"
-            : result.role === "teacher"
-              ? "/"
-              : "/students",
+          result.role === "guardian" ? "/parent" : "/",
         );
         return;
       } else {
@@ -162,8 +159,8 @@ export default function SchoolAuthForm({ mode, token = "" }: SchoolAuthFormProps
           {(mode === "login" || needsToken) && (
             <label className="auth-field">
               {mode === "login" ? "Password" : "New password"}
-              <input
-                type="password"
+              <PasswordInput
+                label={mode === "login" ? "password" : "new password"}
                 name="password"
                 autoComplete={mode === "login" ? "current-password" : "new-password"}
                 required
@@ -178,8 +175,8 @@ export default function SchoolAuthForm({ mode, token = "" }: SchoolAuthFormProps
           {needsToken && (
             <label className="auth-field">
               Confirm new password
-              <input
-                type="password"
+              <PasswordInput
+                label="password confirmation"
                 name="confirm-password"
                 autoComplete="new-password"
                 required

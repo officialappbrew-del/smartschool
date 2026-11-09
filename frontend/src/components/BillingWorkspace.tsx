@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { CheckCircle2, CreditCard, Plus, RefreshCw, Wallet } from "lucide-react";
 import FeedbackModal from "./FeedbackModal";
+import PasswordInput from "./PasswordInput";
 import { schoolApi } from "../lib/school-api";
 
 type BillingSettings = {
@@ -451,10 +452,10 @@ export default function BillingWorkspace() {
                 <input value={publicKey} onChange={(event) => setPublicKey(event.target.value)} placeholder="pk_live_…" autoComplete="off" />
               </label>}
               <label>Provider secret key
-                <input type="password" value={secretKey} onChange={(event) => setSecretKey(event.target.value)} placeholder={settings?.provider === provider && settings.has_secret_key ? "Saved — enter to replace" : "Enter secret key"} autoComplete="new-password" />
+                <PasswordInput label="provider secret key" value={secretKey} onChange={(event) => setSecretKey(event.target.value)} placeholder={settings?.provider === provider && settings.has_secret_key ? "Saved — enter to replace" : "Enter secret key"} autoComplete="new-password" />
               </label>
               {provider === "stripe" && <label>Webhook signing secret
-                <input type="password" value={webhookSecret} onChange={(event) => setWebhookSecret(event.target.value)} placeholder={settings?.provider === provider && settings.has_webhook_secret ? "Saved — enter to replace" : "Enter webhook secret"} autoComplete="new-password" />
+                <PasswordInput label="webhook signing secret" value={webhookSecret} onChange={(event) => setWebhookSecret(event.target.value)} placeholder={settings?.provider === provider && settings.has_webhook_secret ? "Saved — enter to replace" : "Enter webhook secret"} autoComplete="new-password" />
               </label>}
             </>
           )}

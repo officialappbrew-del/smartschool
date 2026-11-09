@@ -436,7 +436,7 @@ class PlatformTenantManagementTests(unittest.TestCase):
     def test_tenant_list_returns_paged_tenant_summaries(self) -> None:
         with patch(
             "app.main.read_tenant_current_revision",
-            return_value="0012_staff_records",
+            return_value="0017_report_card_publication",
         ):
             response = self.client.get(
                 "/api/v1/admin/tenants?skip=0&limit=50",
@@ -1032,6 +1032,21 @@ class TenantIsolationIntegrationTests(unittest.TestCase):
                         **greenwood_headers,
                         "Authorization": f"Bearer {token}",
                     }
+                    academic_year = client.post(
+                        "/api/v1/academic-years",
+                        headers=student_headers,
+                        json={"name": "2026-2027", "is_current": True},
+                    )
+                    self.assertEqual(academic_year.status_code, 201, academic_year.text)
+                    initial_class = client.post(
+                        "/api/v1/classes",
+                        headers=student_headers,
+                        json={
+                            "name": "Grade 5A",
+                            "academic_year_id": academic_year.json()["id"],
+                        },
+                    )
+                    self.assertEqual(initial_class.status_code, 201, initial_class.text)
                     admitted_student = client.post(
                         "/api/v1/students",
                         headers=student_headers,
@@ -1041,8 +1056,7 @@ class TenantIsolationIntegrationTests(unittest.TestCase):
                             "last_name": "Okafor",
                             "date_of_birth": "2015-05-04",
                             "gender": "female",
-                            "class_name": "Grade 5A",
-                            "academic_year": "2026-2027",
+                            "class_section_id": initial_class.json()["id"],
                             "guardian_name": "Ada Okafor",
                             "guardian_email": "ADA@example.com",
                             "guardian_phone": "+2348000000000",
@@ -2182,7 +2196,7 @@ class TenantIsolationIntegrationTests(unittest.TestCase):
                         params={"student_id": student_id},
                     )
                     self.assertEqual(guardian_filtered_report.status_code, 200)
-                    self.assertEqual(len(guardian_filtered_report.json()), 1)
+                    self.assertEqual(guardian_filtered_report.json(), [])
                     parent_report_cards = client.get(
                         f"/api/v1/parents/children/{student_id}/report-cards",
                         headers=guardian_headers,
@@ -2192,7 +2206,56 @@ class TenantIsolationIntegrationTests(unittest.TestCase):
                         200,
                         parent_report_cards.text,
                     )
+                    self.assertEqual(parent_report_cards.json(), [])
+
+                    send_email.side_effect = smtplib.SMTPException("SMTP delivery failed")
+                    publish_report_cards = client.post(
+                        f"/api/v1/classes/{new_class.json()['id']}/terms/{created_term.json()['id']}/report-cards/publish",
+                        headers=student_headers,
+                    )
+                    self.assertEqual(
+                        publish_report_cards.status_code,
+                        200,
+                        publish_report_cards.text,
+                    )
+                    publication = publish_report_cards.json()
+                    self.assertFalse(publication["already_published"])
+                    self.assertEqual(publication["notifications_sent"], 0)
+                    self.assertEqual(publication["notifications_failed"], 1)
+
+                    send_email.side_effect = None
+                    retry_report_card_notifications = client.post(
+                        f"/api/v1/classes/{new_class.json()['id']}/terms/{created_term.json()['id']}/report-cards/publish",
+                        headers=student_headers,
+                    )
+                    self.assertEqual(retry_report_card_notifications.status_code, 200)
+                    self.assertTrue(retry_report_card_notifications.json()["already_published"])
+                    self.assertEqual(retry_report_card_notifications.json()["notifications_sent"], 1)
+                    self.assertEqual(retry_report_card_notifications.json()["notifications_failed"], 0)
+                    self.assertEqual(send_email.await_args.args[0], "ada@example.com")
+                    self.assertIn("/parent", send_email.await_args.args[2])
+                    send_count_after_publish = send_email.await_count
+                    retry_report_card_notifications = client.post(
+                        f"/api/v1/classes/{new_class.json()['id']}/terms/{created_term.json()['id']}/report-cards/publish",
+                        headers=student_headers,
+                    )
+                    self.assertEqual(retry_report_card_notifications.status_code, 200)
+                    self.assertEqual(send_email.await_count, send_count_after_publish)
+                    self.assertEqual(
+                        client.post(
+                            f"/api/v1/classes/{new_class.json()['id']}/terms/{created_term.json()['id']}/report-cards/publish",
+                            headers=teacher_headers,
+                        ).status_code,
+                        403,
+                    )
+
+                    parent_report_cards = client.get(
+                        f"/api/v1/parents/children/{student_id}/report-cards",
+                        headers=guardian_headers,
+                    )
+                    self.assertEqual(parent_report_cards.status_code, 200)
                     self.assertEqual(len(parent_report_cards.json()), 1)
+                    self.assertIsNotNone(parent_report_cards.json()[0]["published_at"])
                     self.assertEqual(
                         float(parent_report_cards.json()[0]["overall_percentage"]),
                         87.5,
@@ -2249,7 +2312,7 @@ class TenantIsolationIntegrationTests(unittest.TestCase):
                         content=(
                             "admission_number,first_name,last_name,date_of_birth,gender,"
                             "class_name,academic_year,guardian_name,guardian_email,guardian_phone\n"
-                            "GR-002,Chidi,Okafor,2014-02-11,male,Grade 6A,2026-2027,"
+                            "GR-002,Chidi,Okafor,2014-02-11,male,Grade 5A,2026-2027,"
                             "Ada Okafor,,+2348000000000\n"
                         ),
                     )
@@ -2295,6 +2358,54 @@ class TenantIsolationIntegrationTests(unittest.TestCase):
                         if class_section["name"] == "Grade 5B"
                     )
                     self.assertEqual(grade_5b["student_count"], 0)
+                    edited_class = client.patch(
+                        f"/api/v1/classes/{grade_5b['id']}",
+                        headers=student_headers,
+                        json={"name": "Grade 5B Updated"},
+                    )
+                    self.assertEqual(edited_class.status_code, 200, edited_class.text)
+                    self.assertEqual(edited_class.json()["name"], "Grade 5B Updated")
+                    archived_class = client.patch(
+                        f"/api/v1/classes/{grade_5b['id']}/archive",
+                        headers=student_headers,
+                    )
+                    self.assertEqual(archived_class.status_code, 204)
+                    active_classes = client.get(
+                        "/api/v1/classes",
+                        headers=student_headers,
+                    )
+                    self.assertNotIn(
+                        grade_5b["id"],
+                        {item["id"] for item in active_classes.json()},
+                    )
+                    all_classes = client.get(
+                        "/api/v1/classes?include_inactive=true",
+                        headers=student_headers,
+                    )
+                    archived_class_record = next(
+                        item for item in all_classes.json()
+                        if item["id"] == grade_5b["id"]
+                    )
+                    self.assertFalse(archived_class_record["is_active"])
+                    unused_class = client.post(
+                        "/api/v1/classes",
+                        headers=student_headers,
+                        json={
+                            "name": "Grade 5C",
+                            "academic_year_id": academic_year.json()["id"],
+                        },
+                    )
+                    self.assertEqual(unused_class.status_code, 201, unused_class.text)
+                    deleted_class = client.delete(
+                        f"/api/v1/classes/{unused_class.json()['id']}",
+                        headers=student_headers,
+                    )
+                    self.assertEqual(deleted_class.status_code, 204)
+                    protected_year_delete = client.delete(
+                        f"/api/v1/academic-years/{academic_year.json()['id']}",
+                        headers=student_headers,
+                    )
+                    self.assertEqual(protected_year_delete.status_code, 409)
 
                     cross_tenant_students = client.get(
                         "/api/v1/students",

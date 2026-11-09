@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
-import { ArrowLeft, BookOpen, ClipboardCheck, GraduationCap, Printer } from "lucide-react";
+import { ArrowLeft, BookOpen, ClipboardCheck, GraduationCap, Printer, Send } from "lucide-react";
 import { schoolApi } from "../lib/school-api";
 import FeedbackModal from "./FeedbackModal";
 
@@ -52,6 +52,7 @@ type StudentReportCard = {
   assessments: ReportAssessment[];
   subjects: ReportSubject[];
   overall_percentage: number | string | null;
+  published_at: string | null;
   attendance: {
     present: number;
     late: number;
@@ -76,7 +77,9 @@ export default function ReportCardsWorkspace() {
   const [reportCards, setReportCards] = useState<StudentReportCard[]>([]);
   const [studentId, setStudentId] = useState("");
   const [loading, setLoading] = useState(true);
+  const [publishing, setPublishing] = useState(false);
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
 
   useEffect(() => {
     let active = true;
@@ -184,6 +187,41 @@ export default function ReportCardsWorkspace() {
       .replace(/\b\w/g, (letter) => letter.toUpperCase());
   const selectedCard = reportCards.find((card) => card.student_id === studentId) ?? null;
 
+  async function publishReportCards() {
+    if (!classId || !termId || account?.role !== "school_admin") return;
+    setPublishing(true);
+    setError("");
+    setNotice("");
+    try {
+      const result = await schoolApi<{
+        already_published: boolean;
+        notifications_sent: number;
+        notifications_failed: number;
+        notifications_pending: number;
+      }>(
+        `/api/v1/classes/${encodeURIComponent(classId)}/terms/${encodeURIComponent(termId)}/report-cards/publish`,
+        { method: "POST" },
+      );
+      const cards = await schoolApi<StudentReportCard[]>(
+        `/api/v1/classes/${encodeURIComponent(classId)}/terms/${encodeURIComponent(termId)}/report-cards`,
+      );
+      setReportCards(cards);
+      const total = result.notifications_sent + result.notifications_failed + result.notifications_pending;
+      const action = result.already_published ? "Publication checked" : "Report cards published";
+      setNotice(
+        result.notifications_failed > 0 || result.notifications_pending > 0
+          ? `${action}. ${result.notifications_sent} guardian email(s) sent; ${result.notifications_failed + result.notifications_pending} need attention. Retry to send them again.`
+          : total === 0
+            ? `${action}. No guardian email addresses are recorded for these students.`
+            : `${action}. ${result.notifications_sent} guardian email(s) sent.`,
+      );
+    } catch (publishError: unknown) {
+      setError(publishError instanceof Error ? publishError.message : "Unable to publish report cards.");
+    } finally {
+      setPublishing(false);
+    }
+  }
+
   return (
     <div className="student-workspace report-cards-workspace">
       <aside className="student-sidebar">
@@ -217,9 +255,24 @@ export default function ReportCardsWorkspace() {
             <div>
               <p className="eyebrow">TERM RESULTS</p>
               <h1>Student report cards</h1>
-              <p className="page-description">Review term assessment results and attendance for a class.</p>
+              <p className="page-description">
+                Review term assessment results and attendance for a class.
+                {selectedCard?.published_at ? " Parent access is enabled for this term." : ""}
+              </p>
             </div>
+            {account?.role === "school_admin" && (
+              <button
+                className="button button-primary"
+                type="button"
+                onClick={() => void publishReportCards()}
+                disabled={publishing || reportCards.length === 0 || !classId || !termId}
+              >
+                <Send size={15} />
+                {publishing ? "Publishing…" : "Publish / retry notifications"}
+              </button>
+            )}
           </section>
+          {notice && <p className="attendance-notice no-print" role="status">{notice}</p>}
 
           <section className="panel report-filter-panel no-print">
             <label>Class section

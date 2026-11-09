@@ -46,6 +46,8 @@ The database role must be able to create schemas. Generate a random secret for t
 
 To email the first administrator, also configure `EMAIL_HOST`, `EMAIL_PORT`, `EMAIL_USE_TLS`, `EMAIL_USE_SSL`, `EMAIL_HOST_USER`, `EMAIL_HOST_PASSWORD`, and `DEFAULT_FROM_EMAIL` in `backend/.env`. For Gmail, use an App Password, not your regular account password.
 
+Northstar sends invitations, password-reset links, school announcements, and attendance alerts using a consistent, mobile-friendly HTML email layout with a plain-text alternative. Configure `DEFAULT_FROM_EMAIL` as a recognizable school or platform address; recipients can still read the plain-text version in email clients that do not display HTML.
+
 ### 2. Configure and start the frontend
 
 Open a second PowerShell window:
@@ -96,7 +98,11 @@ The tenant list also shows each school's current database migration status, lets
 
 To give a parent access, add the guardian's email address to the student's record. In the **Students** list, select the envelope icon on that student's row to send a one-time invitation. The guardian sets a password from the email link and signs in at the school's `/login` page; parent accounts open the read-only `/parent` portal, where they can view linked students' attendance and term report cards.
 
+To release term results, a school administrator opens **Report cards**, selects a class and academic term, reviews the computed cards, and chooses **Publish report cards**. Parents see only published results. Northstar emails each recorded guardian address once; if delivery fails, the administrator can retry failed notifications from the same class and term. Configure SMTP before publishing if guardian email alerts are required.
+
 To set up teacher access, open **Classes** as a school administrator, invite the teacher by email, and assign one or more class sections. After accepting the invitation, teachers sign in at `http://ngogenhospital.localhost:5173/login` and land on their teacher dashboard. It lists assigned classes, links to attendance and grade entry, and shows the teacher's weekly timetable. Offline attendance and grade changes are saved in that browser's local storage and sync when the connection returns; load the class roster or gradebook while online at least once before working offline.
+
+When attendance sync takes a student's rate below 80% after at least five non-excused attendance days have been recorded, Northstar emails the guardian on that student record. Present and late marks count toward the rate; absent marks do not. Alerts are sent on a drop below the threshold, not on every later sync while the rate remains below it. Configure SMTP using the email settings above.
 
 ## Configure tenant fees
 

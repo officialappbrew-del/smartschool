@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 import { type FormEvent, useEffect, useState } from "react";
 import FeedbackModal from "./FeedbackModal";
+import PasswordInput from "./PasswordInput";
 
 type Tenant = {
   identifier: string;
@@ -326,8 +327,8 @@ export default function PlatformAdminDashboard() {
           </label>
           <label className="platform-admin-field">
             Password
-            <input
-              type="password"
+            <PasswordInput
+              label="platform administrator password"
               autoComplete="current-password"
               value={passwordInput}
               onChange={(event) => setPasswordInput(event.target.value)}

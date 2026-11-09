@@ -9,6 +9,7 @@ export type Student = {
   gender: string;
   class_name: string;
   academic_year: string;
+  admission_status: "new" | "in_review" | "accepted" | "enrolled" | "waitlist" | "withdrawn";
   guardian_name: string;
   guardian_email: string | null;
   guardian_phone: string;
@@ -16,7 +17,12 @@ export type Student = {
   is_active: boolean;
 };
 
-export type StudentInput = Omit<Student, "id" | "is_active">;
+export type StudentInput = Omit<
+  Student,
+  "id" | "is_active" | "class_name" | "academic_year"
+> & {
+  class_section_id: string;
+};
 
 export type StudentList = {
   items: Student[];

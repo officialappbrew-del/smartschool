@@ -6,6 +6,7 @@ import {
   Bell,
   BarChart3,
   BookOpen,
+  Bus,
   CalendarDays,
   Check,
   ChevronDown,
@@ -18,6 +19,7 @@ import {
   Ellipsis,
   FileText,
   GraduationCap,
+  Home,
   LayoutDashboard,
   Menu,
   Megaphone,
@@ -40,13 +42,25 @@ import FeedbackModal from "../components/FeedbackModal";
 import BillingWorkspace from "../components/BillingWorkspace";
 import AnalyticsWorkspace from "../components/AnalyticsWorkspace";
 import AnnouncementWorkspace from "../components/AnnouncementWorkspace";
+import AttendanceWorkspace from "../components/AttendanceWorkspace";
+import ClassWorkspace from "../components/ClassWorkspace";
+import GradeWorkspace from "../components/GradeWorkspace";
 import { MessageModerationWorkspace } from "../components/MessagingWorkspace";
+import PayrollWorkspace from "../components/PayrollWorkspace";
+import ReportCardsWorkspace from "../components/ReportCardsWorkspace";
+import ReportsWorkspace from "../components/ReportsWorkspace";
+import StudentWorkspace from "../components/StudentWorkspace";
 import TimetableWorkspace from "../components/TimetableWorkspace";
+import LibraryWorkspace from "../components/LibraryWorkspace";
+import TransportWorkspace from "../components/TransportWorkspace";
+import BoardingWorkspace from "../components/BoardingWorkspace";
+import LearningWorkspace from "../components/LearningWorkspace";
+import CampusWorkspace from "../components/CampusWorkspace";
 import TeacherDashboard from "../components/TeacherDashboard";
 import { attendanceTenant, getCachedAccount } from "../lib/offline-attendance";
 import { schoolApi } from "../lib/school-api";
 
-type Section = "Overview" | "Analytics" | "Students" | "Attendance" | "Grades" | "Report cards" | "Fees" | "Announcements" | "Message moderation" | "Timetable";
+type Section = "Overview" | "Analytics" | "Reports" | "Payroll" | "Students" | "Attendance" | "Grades" | "Report cards" | "Fees" | "Announcements" | "Message moderation" | "Timetable" | "Learning" | "Campuses" | "Library" | "Transport" | "Boarding";
 type AttendanceState = "Present" | "Absent" | "Late";
 
 type Student = {
@@ -185,6 +199,8 @@ function App() {
   const sectionTitle: Record<Section, string> = {
     Overview: "School overview",
     Analytics: "School analytics",
+    Reports: "Custom reports",
+    Payroll: "Staff payroll",
     Students: "Your students",
     Attendance: "Attendance",
     Grades: "Grades",
@@ -193,10 +209,17 @@ function App() {
     Announcements: "School announcements",
     "Message moderation": "Message moderation",
     Timetable: "Weekly timetable",
+    Learning: "Learning management",
+    Campuses: "Campus administration",
+    Library: "Library management",
+    Transport: "Transport management",
+    Boarding: "Boarding management",
   };
   const sectionDescription: Record<Section, string> = {
     Overview: "A live view of enrollment, attendance, fees, and academic outcomes.",
     Analytics: "Explore current school performance using your tenant's recorded data.",
+    Reports: "Generate custom school insight reports filtered by class, date range, and enrollment scope.",
+    Payroll: "Review salary batches, approve payroll, and keep staff pay aligned to the current school cycle.",
     Students: "Manage your school community, all in one place.",
     Attendance: "Keep track of today’s attendance across your school.",
     Grades: "Create assessments and record student scores.",
@@ -205,6 +228,11 @@ function App() {
     Announcements: "Share important updates with parents and guardians.",
     "Message moderation": "Review messages flagged by teachers and parents.",
     Timetable: "Schedule classes, teachers, subjects, and rooms.",
+    Learning: "Create learning courses, assign tasks, and manage academic delivery across the school.",
+    Campuses: "Manage multiple school campuses, codes, and locations from one tenant workspace.",
+    Library: "Track books, issue circulation, and manage overdue fines with a tenant-wide library policy.",
+    Transport: "Coordinate routes, pickup/drop-off coverage, and transport movement logs for the school day.",
+    Boarding: "Manage hostel rooms, resident assignments, and boarding occupancy.",
   };
 
   return (
@@ -284,6 +312,72 @@ function App() {
               <Megaphone size={18} strokeWidth={1.8} /><span>Announcements</span>
             </button>
           )}
+          {isSchoolAdmin && (
+            <button
+              className={`nav-item${activeSection === "Learning" ? " nav-item-active" : ""}`}
+              onClick={() => {
+                setActiveSection("Learning");
+                setMenuOpen(false);
+              }}
+            >
+              <BookOpen size={18} strokeWidth={1.8} /><span>Learning</span>
+            </button>
+          )}
+          {isSchoolAdmin && (
+            <button
+              className={`nav-item${activeSection === "Campuses" ? " nav-item-active" : ""}`}
+              onClick={() => {
+                setActiveSection("Campuses");
+                setMenuOpen(false);
+              }}
+            >
+              <Home size={18} strokeWidth={1.8} /><span>Campuses</span>
+            </button>
+          )}
+          {isSchoolAdmin && (
+            <button
+              className={`nav-item${activeSection === "Library" ? " nav-item-active" : ""}`}
+              onClick={() => {
+                setActiveSection("Library");
+                setMenuOpen(false);
+              }}
+            >
+              <BookOpen size={18} strokeWidth={1.8} /><span>Library</span>
+            </button>
+          )}
+          {isSchoolAdmin && (
+            <button
+              className={`nav-item${activeSection === "Transport" ? " nav-item-active" : ""}`}
+              onClick={() => {
+                setActiveSection("Transport");
+                setMenuOpen(false);
+              }}
+            >
+              <Bus size={18} strokeWidth={1.8} /><span>Transport</span>
+            </button>
+          )}
+          {isSchoolAdmin && (
+            <button
+              className={`nav-item${activeSection === "Boarding" ? " nav-item-active" : ""}`}
+              onClick={() => {
+                setActiveSection("Boarding");
+                setMenuOpen(false);
+              }}
+            >
+              <Home size={18} strokeWidth={1.8} /><span>Boarding</span>
+            </button>
+          )}
+          {isSchoolAdmin && (
+            <button
+              className={`nav-item${activeSection === "Payroll" ? " nav-item-active" : ""}`}
+              onClick={() => {
+                setActiveSection("Payroll");
+                setMenuOpen(false);
+              }}
+            >
+              <Wallet size={18} strokeWidth={1.8} /><span>Payroll</span>
+            </button>
+          )}
           <button
             className={`nav-item${activeSection === "Analytics" ? " nav-item-active" : ""}`}
             onClick={() => {
@@ -292,6 +386,15 @@ function App() {
             }}
           >
             <BarChart3 size={18} strokeWidth={1.8} /><span>Analytics</span>
+          </button>
+          <button
+            className={`nav-item${activeSection === "Reports" ? " nav-item-active" : ""}`}
+            onClick={() => {
+              setActiveSection("Reports");
+              setMenuOpen(false);
+            }}
+          >
+            <FileText size={18} strokeWidth={1.8} /><span>Reports</span>
           </button>
           <button className="nav-item" onClick={() => {
             if (isSchoolAdmin) setActiveSection("Timetable");
@@ -322,7 +425,7 @@ function App() {
           <div className="breadcrumbs"><span>Workspace</span><ChevronRight size={14} /><strong>{activeSection}</strong></div>
           <div className="topbar-actions">
             <span className="today-label">{todayLabel}</span>
-            {activeSection !== "Overview" && activeSection !== "Analytics" && activeSection !== "Fees" && activeSection !== "Announcements" && activeSection !== "Message moderation" && activeSection !== "Timetable" && <span className="demo-pill">DEMO DATA</span>}
+            {activeSection !== "Overview" && activeSection !== "Analytics" && activeSection !== "Fees" && activeSection !== "Announcements" && activeSection !== "Message moderation" && activeSection !== "Timetable" && activeSection !== "Transport" && <span className="demo-pill">DEMO DATA</span>}
             <button className={`icon-button notification-button${showNotifications ? " pressed" : ""}`} aria-label="Notifications" onClick={() => setShowNotifications(!showNotifications)}>
               <Bell size={18} /><span className="notification-dot" />
             </button>
@@ -350,8 +453,10 @@ function App() {
             </div>}
           </section>
 
-          {activeSection === "Overview" || activeSection === "Analytics" ? <AnalyticsWorkspace /> : activeSection === "Fees" ? <BillingWorkspace /> : activeSection === "Announcements" ? <AnnouncementWorkspace /> : activeSection === "Message moderation" ? <MessageModerationWorkspace /> : activeSection === "Timetable" ? <TimetableWorkspace /> : <>
-          <section className="stat-grid" aria-label="School statistics">
+          {activeSection === "Overview" ? <AnalyticsWorkspace /> : activeSection === "Analytics" ? <AnalyticsWorkspace /> : activeSection === "Reports" ? <ReportsWorkspace /> : activeSection === "Payroll" ? <PayrollWorkspace /> : activeSection === "Students" ? <StudentWorkspace /> : activeSection === "Attendance" ? <AttendanceWorkspace /> : activeSection === "Grades" ? <GradeWorkspace /> : activeSection === "Report cards" ? <ReportCardsWorkspace /> : activeSection === "Fees" ? <BillingWorkspace /> : activeSection === "Announcements" ? <AnnouncementWorkspace /> : activeSection === "Message moderation" ? <MessageModerationWorkspace /> : activeSection === "Timetable" ? <TimetableWorkspace /> : activeSection === "Learning" ? <LearningWorkspace /> : activeSection === "Campuses" ? <CampusWorkspace /> : activeSection === "Library" ? <LibraryWorkspace /> : activeSection === "Transport" ? <TransportWorkspace /> : activeSection === "Boarding" ? <BoardingWorkspace /> : <ClassWorkspace />}
+          {(activeSection === "Overview" || activeSection === "Analytics") && (
+            <>
+              <section className="stat-grid" aria-label="School statistics">
             <article className="stat-card">
               <div className="stat-heading"><span>Total students</span><span className="stat-icon violet-icon"><Users size={17} /></span></div>
               <div className="stat-value">1,284</div>
@@ -446,7 +551,8 @@ function App() {
           </section>
 
           <footer className="page-footer"><span>© {new Date().getFullYear()} Northstar School Management</span><button onClick={() => setNotice("Help center is coming soon.")}><CircleHelp size={14} /> Help center</button><span className="footer-status">Demo workspace · sample data only</span></footer>
-          </>}
+            </>
+          )}
         </div>
       </main>
       <FeedbackModal message={notice} tone="info" onClose={() => setNotice("")} />
